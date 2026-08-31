@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Roguelike Yatzy</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<button id="restartBtn" class="restart-btn" title="Erase progress and start a new run">Restart</button>
+<button id="debugMoneyBtn" class="debug-money-btn" title="Debug: add $100">+$100</button>
+<button id="particlesToggleBtn" class="debug-money-btn particles-toggle-btn" title="Toggle the ember/purple/rain/ash particle effects">Particles: ON</button>
+<div id="situationalSweep" class="situational-sweep"></div>
+<div id="bossArrivalVignette" class="boss-arrival-vignette"></div>
+<div id="turnTransitionSweep" class="turn-transition-sweep"></div>
+<div id="dangerVignette" class="danger-vignette"></div>
+<div id="radialFlash" class="radial-flash"></div>
+<div id="ambientVignette" class="ambient-vignette"></div>
+<div id="handBannerGodRays" class="hand-banner-god-rays"></div>
+<canvas id="redWarpCanvas" class="boss-warp-canvas" aria-hidden="true"></canvas>
+<canvas id="purpleWarpCanvas" class="boss-warp-canvas" aria-hidden="true"></canvas>
+<div id="emberParticlesBack" class="ember-particles ember-particles-back"></div>
+<div id="emberParticlesMid" class="ember-particles ember-particles-mid"></div>
+<div id="emberParticlesFront" class="ember-particles ember-particles-front"></div>
+<div id="purpleParticlesBack" class="purple-particles purple-particles-back"></div>
+<div id="purpleParticlesMid" class="purple-particles purple-particles-mid"></div>
+<div id="purpleParticlesFront" class="purple-particles purple-particles-front"></div>
+<div id="rainParticlesBack" class="rain-particles rain-particles-back"></div>
+<div id="rainParticlesMid" class="rain-particles rain-particles-mid"></div>
+<div id="rainParticlesFront" class="rain-particles rain-particles-front"></div>
+<div id="ashParticlesBack" class="ash-particles ash-particles-back"></div>
+<div id="ashParticlesMid" class="ash-particles ash-particles-mid"></div>
+<div id="ashParticlesFront" class="ash-particles ash-particles-front"></div>
+<div id="leafParticlesBack" class="leaf-particles leaf-particles-back"></div>
+<div id="leafParticlesMid" class="leaf-particles leaf-particles-mid"></div>
+<div id="leafParticlesFront" class="leaf-particles leaf-particles-front"></div>
+<div class="corner-stack">
+  <div class="total-score-badge">
+    <span class="label">Total Score</span>
+    <span id="statGrandTotal">0</span>
+  </div>
+</div>
+
+<button id="packOfferBanner" class="pack-offer-banner hidden" type="button"></button>
+
+<div id="collectionOverlay" class="modal-overlay hidden">
+  <div class="modal collection-modal" id="collectionModal">
+    <button id="collectionBackBtn" class="collection-back-btn">&larr; Back</button>
+    <div class="collection-modal-body">
+      <h2>Card Collection</h2>
+
+      <div class="collection-section">
+        <h3>Perks <span class="collection-section-chance" id="perksChanceLabel"></span></h3>
+        <div class="collection-grid" id="collectionPerks"></div>
+      </div>
+
+      <div class="collection-section">
+        <h3>Category Cards <span class="collection-section-chance boosted" id="categoryChanceLabel"></span> <span class="collection-section-chance mega" id="megaChanceLabel"></span></h3>
+        <div class="collection-grid" id="collectionCategoryCards"></div>
+      </div>
+
+      <div class="collection-section">
+        <h3>Rule Cards</h3>
+        <div class="collection-grid" id="collectionRuleCards"></div>
+      </div>
+
+      <div class="collection-section">
+        <h3>Usables</h3>
+        <div class="collection-grid" id="collectionUsables"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="bossesOverlay" class="modal-overlay hidden">
+  <div class="modal collection-modal" id="bossesModal">
+    <button id="bossesBackBtn" class="collection-back-btn">&larr; Back</button>
+    <div class="collection-modal-body">
+      <h2>Bosses</h2>
+      <div class="bosses-list" id="bossesList"></div>
+    </div>
+  </div>
+</div>
+
+<div id="app">
+
+  <main class="board">
+    <section class="dice-area" id="diceArea">
+      <div id="perkTrash" class="perk-trash hidden">
+        <span class="perk-trash-icon">🗑</span>
+        <span class="perk-trash-gain hidden">+$3</span>
+      </div>
+
+      <div id="nextBossLabel" class="next-boss-label hidden">
+        <span id="nextBossLabelText"></span>
+        <span id="nextBossUsableBadge" class="next-boss-usable-badge">
+          <span id="nextBossUsableBadgeText"></span>
+          <div id="nextBossUsableTooltip" class="perk-tooltip next-boss-usable-tooltip"></div>
+        </span>
+        <div id="nextBossTooltip" class="perk-tooltip"></div>
+      </div>
+
+      <div id="mainGameModifier" class="main-game-modifier main-game-modifier-hidden">
+        <div id="mainGameModifierTitle" class="main-game-modifier-title"></div>
+        <div id="mainGameModifierBox" class="main-game-modifier-box">
+          <div id="mainGameModifierDesc" class="main-game-modifier-desc"></div>
+        </div>
+      </div>
+
+      <div id="handBanner" class="hand-banner"></div>
+
+      <div class="perk-slots" id="perkSlots"></div>
+
+      <div class="dice-tray" id="diceTray"></div>
+
+      <div class="controls">
+        <button id="rollBtn" class="roll-btn">Throw Dice</button>
+        <div id="rollsLeft" class="rolls-left">3 throws left</div>
+        <button id="mulliganBtn" class="mulligan-btn mulligan-btn-hidden" title="Undo your last commit and re-roll that hand from scratch">Revert</button>
+      </div>
+
+      <div class="stats">
+        <div class="stat"><span class="label">Level</span><span id="statLevel">1</span></div>
+        <div class="stat"><span class="label">Score</span><span id="statScore">0</span></div>
+        <div class="stat"><span class="label">Target</span><span id="statTarget">150</span></div>
+        <div class="stat"><span class="label">Turn</span><span id="statTurn">1 / 15</span></div>
+        <div class="stat stat-money"><span class="label">Money</span><span id="statMoney">0</span><span id="moneyGainCue" class="money-gain-cue hidden">+$0</span><span id="goldenTouchGainCue" class="golden-touch-gain hidden">+$0</span></div>
+      </div>
+
+      <div class="stats-divider"></div>
+
+      <div class="perk-slots" id="bonusSlots">
+        <div class="perk-slot"></div>
+        <div class="perk-slot"></div>
+        <div class="perk-slot"></div>
+      </div>
+
+      <button id="refreshPackBtn" class="refresh-pack-btn refresh-pack-btn-hidden">Refresh</button>
+    </section>
+
+    <section class="scorecard" id="scorecardPanel">
+      <h2>Scorecard</h2>
+      <table id="scoreTable">
+        <tbody id="scoreBody"></tbody>
+      </table>
+    </section>
+
+    <section class="rule-inventory-column" id="ruleInventoryColumn">
+      <h2>Rule Cards</h2>
+      <div id="ruleInventory" class="rule-inventory hidden"></div>
+      <h2>Usables</h2>
+      <div id="usableInventory" class="rule-inventory hidden"></div>
+      <button id="bossesBtn" class="collection-btn" title="View every boss and their unique feature">👹 Bosses</button>
+      <button id="collectionBtn" class="collection-btn" title="View all perks and cards">📖 Cards</button>
+    </section>
+  </main>
+
+  <div id="modalOverlay" class="modal-overlay hidden">
+    <div class="modal" id="modalBox" tabindex="-1"></div>
+  </div>
+
+</div>
+<script src="script.js"></script>
+</body>
+</html>
