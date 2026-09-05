@@ -11,6 +11,7 @@
 <button id="restartBtn" class="restart-btn" title="Erase progress and start a new run">Restart</button>
 <button id="debugMoneyBtn" class="debug-money-btn" title="Debug: add $100">+$100</button>
 <button id="particlesToggleBtn" class="debug-money-btn particles-toggle-btn" title="Toggle the ember/purple/rain/ash particle effects">Particles: ON</button>
+<button id="debugBlessingBtn" class="debug-money-btn debug-blessing-btn" title="Debug: open a Blessing pack">Blessing</button>
 <div id="situationalSweep" class="situational-sweep"></div>
 <div id="bossArrivalVignette" class="boss-arrival-vignette"></div>
 <div id="turnTransitionSweep" class="turn-transition-sweep"></div>
@@ -89,17 +90,18 @@
     <section class="dice-area" id="diceArea">
       <div id="perkTrash" class="perk-trash hidden">
         <span class="perk-trash-icon">🗑</span>
-        <span class="perk-trash-gain hidden">+$3</span>
+        <span class="perk-trash-gain hidden" style="display: none;">+$3</span>
       </div>
 
       <div id="nextBossLabel" class="next-boss-label hidden">
         <span id="nextBossLabelText"></span>
-        <span id="nextBossUsableBadge" class="next-boss-usable-badge">
-          <span id="nextBossUsableBadgeText"></span>
-          <div id="nextBossUsableTooltip" class="perk-tooltip next-boss-usable-tooltip"></div>
-        </span>
         <div id="nextBossTooltip" class="perk-tooltip"></div>
       </div>
+
+      <span id="nextBossUsableBadge" class="next-boss-usable-badge hidden">
+        <span id="nextBossUsableBadgeText"></span>
+        <div id="nextBossUsableTooltip" class="perk-tooltip next-boss-usable-tooltip"></div>
+      </span>
 
       <div id="mainGameModifier" class="main-game-modifier main-game-modifier-hidden">
         <div id="mainGameModifierTitle" class="main-game-modifier-title"></div>
@@ -120,12 +122,14 @@
         <button id="mulliganBtn" class="mulligan-btn mulligan-btn-hidden" title="Undo your last commit and re-roll that hand from scratch">Revert</button>
       </div>
 
+      <div class="stats-divider stats-divider-top"></div>
+
       <div class="stats">
         <div class="stat"><span class="label">Level</span><span id="statLevel">1</span></div>
         <div class="stat"><span class="label">Score</span><span id="statScore">0</span></div>
         <div class="stat"><span class="label">Target</span><span id="statTarget">150</span></div>
         <div class="stat"><span class="label">Turn</span><span id="statTurn">1 / 15</span></div>
-        <div class="stat stat-money"><span class="label">Money</span><span id="statMoney">0</span><span id="moneyGainCue" class="money-gain-cue hidden">+$0</span><span id="goldenTouchGainCue" class="golden-touch-gain hidden">+$0</span></div>
+        <div class="stat stat-money"><span class="label">Money</span><span id="statMoney">0</span><span id="moneyGainCue" class="money-gain-cue hidden" style="display: none;">+$0</span><span id="goldenTouchGainCue" class="golden-touch-gain hidden" style="display: none;">+$0</span></div>
       </div>
 
       <div class="stats-divider"></div>
@@ -149,6 +153,7 @@
     <section class="rule-inventory-column" id="ruleInventoryColumn">
       <h2>Rule Cards</h2>
       <div id="ruleInventory" class="rule-inventory hidden"></div>
+      <div class="ornate-divider"></div>
       <h2>Usables</h2>
       <div id="usableInventory" class="rule-inventory hidden"></div>
       <button id="bossesBtn" class="collection-btn" title="View every boss and their unique feature">👹 Bosses</button>

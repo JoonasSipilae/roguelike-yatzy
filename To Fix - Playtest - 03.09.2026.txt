@@ -1,0 +1,167 @@
+
+
+
+
+CLAUDE. STOP HERE.
+
+
+
+Have an option on small game scoreboard, "AUTO SELECT" Selects automatically the highest paying row.
+Sees the hotline etc.
+
+
+
+Streak die is to too OP
+
+
+If blessing of the censor duplicates a perk that doesnt stack. stack it anyway.
+1. Does edict prevent using these?
+NO:  Make sure that it works on edict too.
+YES: Ok.
+
+
+
+
+
+
+ADD
+
+Player can choose manually which dices they want to use, ex. 5, 5, 6, 6, player can choose to use
+Fives instead of Sixes.
+Add a button (manually select) player then clicks which dices they want to use for score calculation.
+
+
+
+######################################################################################################################
+
+
+
+DONE
+
+
+
+1.
+Blue Die description. Update to:
+"Paints one die's face blue. Commit a hand with that die contributing, and its face value gets added to your score too. (Stacks up to 3 times)"
+
+2.
+If player makes enough money during a Boss to get a usable, the usable sometimes stays greyed out
+Refreshing the page activates it for purchase. Activate it whenever player gets enough money to purchase it.
+Same is happening in small games.
+
+3.
+Make all tooltips font size +1
+
+4.
+In small games show the red x mult as "-x" since it doesnt matter there. Update back to current in Bosses
+
+5.
+in small games, if lucky die activates the x2 score, dont show the "Lucky die activated, 2x score" since the score doesnt matter in small games
+
+6.
+Slow down the green "+?$" money gain animation by 0,5s. Slow the money count up animation by 0,5s.
+
+7.
+Change next round button when ur going to boss to "Boss"
+
+8.
+When a In clean slate rule card is offered in a pack, show how much money user would gain by using it in the description as last line. "Current +$?"
+
+9.
+Remove text highlight on scoreboard and throw button. Keep elsewhere
+
+10.
+Lucky die animation resets every time you lock any die. Make it keep looping and not be interrupted by locking a die.
+
+
+
+
+
+1. 
+Using blessing / usable rerolls the hotlines highlighted  row
+
+2. 
+Show lucky number, hotline etc. in scoreboard tooltip calculations. Its currently unclear where the mults are coming from-
+
+3.
+In scoreboard tooltips clip out of screen.
+Also, In all tooptips have the chevron over the element the tooltip comes from
+
+4.
+If streak die shows 10 when you commit, it should give 10 points, not 11.
+
+5.
+If user wins in the last turn, it goes straight to the perk popup.
+It should also require user to click the nexr round button.
+
+6.
+Make sure that changing a perk to another adds X mult to "Demolisher" perk card
+
+7.
+Skipping blessing pack doesnt upgrade skipper or lucky skip. Make it work
+
+8.
+Fire Sale Fixed
+
+
+
+
+Situation:
+Player has Perks: Hotline, Wild die, All luck.
+With this setup player has 2 hotlines and wild die 1/2 throws
+Player duplicates All luck with Blessing of the Edict.
+With this setup player should have 3x Hotline and Wild Die every throw.
+Neither did work
+
+
+
+
+Wild die seems to mess up the streak die.
+If player has a hand that can only be thrown using the wild die and that hand also contains a streak die 
+-> Streak dies points do not get added to the score
+	SITUATION:
+	?, 4, 4, 4, 4, 2
+	4 is streak die.
+	Doesnt show Streak die points on Five of a kind
+	If wild die messing it up? is something else the problem?
+
+
+
+
+Stores get randomly locked way after they should.
+The stores seem to lock the first time after the card deletes itself, not at the next store.
+The stores get randonly locked suring small games after that for the whole game.
+
+
+
+
+High Stakes. Explain clearly that it affects Growth rate, and it compounds — not a flat +2% on every target.
+by level 25 a single High Stakes has made the target 44.5% higher.
+Change rate 2% -> 1%
+
+
+
+
+Make sure that if i scratch a straight while having straight shot active, it doesnt add to the cards x mult. Actual straight needs to be committed.
+Make sure that straight shot doesnt add to mult in small games.
+Make sure the straight shot adds the mult only when committing a straight.
+Make sure when straight is selected via arrow keys or hovered, it updates the X mult on the card and the total x mult label
+Also change the X mult gain to 0,15x per straight committed
+
+
+
+
+Check that multiple copies of make it count, fire sale etc. dont disappear all if one goes away.
+
+Make "Make It Count" last 2 bosses. Update description, Say "? Bosses left"
+
+Does blessing of the censor copy the streak dies current value too?
+- Checked. Works. Mulligan also checked. Works
+
+Base points changed, slightly better in some.
+
+
+Third times the charm description made clearer
+
+
+

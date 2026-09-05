@@ -57,13 +57,36 @@ const SMALL_GAME_TARGETS = {
 // adjust the growth RATE itself: Steady Nerves slows it by
 // STEADY_NERVES_GROWTH_REDUCTION_PER_STACK per stack (20% -> 17% -> 14% at
 // its 2-stack cap), High Stakes speeds it up by
-// HIGH_STAKES_GROWTH_INCREASE_PER_STACK per stack (20% -> 22% -> 24%...,
-// uncapped).
+// HIGH_STAKES_GROWTH_INCREASE_PER_STACK per stack (20% -> 21% -> 22%...,
+// uncapped). Because this compounds level over level rather than adding a
+// flat amount to any single target, even a small per-level bump snowballs
+// hard over a full run - one copy alone makes level 25's target ~20.3%
+// higher than it would've been (a naive "just add 1% to the target"
+// reading badly undersells it).
 const MAIN_TARGET_BASE = 150;
-const MAIN_TARGET_GROWTH_RATE = 1.20;
+// Default per-level growth rate ramps up as the run goes on, rather than
+// one flat rate for every level - level 1 has no incoming transition (it's
+// just MAIN_TARGET_BASE itself), then each tier below is the rate applied
+// on the transition INTO reaching a level in that range (so e.g. reaching
+// level 7 multiplies level 6's target by 1.235, and level 8 does too;
+// level 9 switches to 1.27). Checked in order, first match wins. Caps out
+// at +35% (the old 15-16 tier's own rate) - every transition into level 15
+// or beyond now uses that same rate forever, rather than continuing to
+// ramp up to +37.5%/+40% the way it used to.
+const MAIN_TARGET_GROWTH_TIERS = [
+  { maxLevel: 6, rate: 1.20 },
+  { maxLevel: 8, rate: 1.235 },
+  { maxLevel: 10, rate: 1.27 },
+  { maxLevel: 12, rate: 1.30 },
+  { maxLevel: 14, rate: 1.325 },
+  { maxLevel: Infinity, rate: 1.35 },
+];
+function defaultMainTargetGrowthRate(level) {
+  return MAIN_TARGET_GROWTH_TIERS.find((t) => level <= t.maxLevel).rate;
+}
 const STEADY_NERVES_MAX_STACKS = 2;
 const STEADY_NERVES_GROWTH_REDUCTION_PER_STACK = 0.03;
-const HIGH_STAKES_GROWTH_INCREASE_PER_STACK = 0.02;
+const HIGH_STAKES_GROWTH_INCREASE_PER_STACK = 0.01;
 
 // Refreshing the shop slots costs money, rising by REFRESH_COST_INCREMENT
 // each use within the same shop session - reset back to REFRESH_COST_BASE
@@ -81,6 +104,12 @@ const PERK_REROLL_COST = 60;
 // shiny - a shiny copy still gets its own visible perk-card slot, it just
 // doesn't count against the normal slot cap (see effectivePerkSlotCount()).
 const SHINY_PERK_CHANCE = 0.025;
+
+// showLevelCompleteModal()'s own rollOptions() - when perk slots are full
+// at the moment the offer opens, Extra Perk has this chance of being forced
+// into the 3 offered cards (see isFullAtOpen) instead of a guaranteed 100%,
+// so a full board isn't ALWAYS handed a free way out.
+const EXTRA_PERK_GUARANTEE_CHANCE = 0.5;
 
 // Lucky Skip: every skipPackOffer() call (declining a category OR rule pack)
 // permanently banks this much extra Shiny/Boosted chance per owned copy,
@@ -101,16 +130,27 @@ function effectiveShinyChance() {
 // Takes an explicit state object (not the global) since this also needs to
 // run on a not-yet-assigned loaded/merged save inside sanitizeTargetProgression,
 // before that object becomes the live state.
+//
+// Since the default rate itself now varies by level (see
+// MAIN_TARGET_GROWTH_TIERS above) rather than being one flat number, this
+// can't just raise a single rate to a power any more - it compounds level
+// by level from MAIN_TARGET_BASE, applying each transition's own default
+// rate (plus the same flat Steady Nerves/High Stakes adjustment every
+// transition gets) in turn. Level 1 has no incoming transition, so the
+// loop from 2 up to `level` is naturally a no-op there.
 function computeMainTarget(s, level) {
   const steadyNervesStacks = Math.min(
     STEADY_NERVES_MAX_STACKS,
     (s.perksOwned || []).filter((p) => p.id === "easyTarget").length
   );
   const highStakesStacks = (s.perksOwned || []).filter((p) => p.id === "highStakes").length;
-  const growthRate = MAIN_TARGET_GROWTH_RATE
+  const growthRateAdjustment =
     - STEADY_NERVES_GROWTH_REDUCTION_PER_STACK * steadyNervesStacks
     + HIGH_STAKES_GROWTH_INCREASE_PER_STACK * highStakesStacks;
-  const raw = MAIN_TARGET_BASE * Math.pow(growthRate, Math.max(0, level - 1));
+  let raw = MAIN_TARGET_BASE;
+  for (let lvl = 2; lvl <= level; lvl++) {
+    raw *= defaultMainTargetGrowthRate(lvl) + growthRateAdjustment;
+  }
   return roundDownTo5(raw);
 }
 
@@ -144,7 +184,10 @@ function turnLimit() {
   // Make it count shaves 2 turns off the main game per active copy - never
   // below 1, however many are stacked. The Hourglass shaves a flat 2 more
   // on top, regardless of Make it Count stacks - see activeBossModifier().
-  const reduction = 2 * activeMakeItCountStacks() + (activeBossModifier()?.id === "theHourglass" ? 2 : 0);
+  // Blessing of The Hourglass reverses that exact same flat 2, independent
+  // of whether The Hourglass is this level's actual boss (see hasBlessing()).
+  const reduction = 2 * activeMakeItCountStacks() + (activeBossModifier()?.id === "theHourglass" ? 2 : 0)
+    - (hasBlessing("blessing_theHourglass") ? BLESSING_HOURGLASS_TURNS : 0);
   const limit = Math.max(1, baseTurns - reduction);
   // Sabotage/The Culler both permanently remove categories from play for
   // the rest of the level (see categoryIsBlocked()'s own comment) - if
@@ -169,6 +212,7 @@ function turnLimit() {
   if (activeBossModifier()?.id !== "theTurnkey") {
     const permanentlyBlockedCount = activeCategories().filter(
       (cat) => state.blockedCategoryKeys.includes(cat.key) || state.cullerBlockedCategoryKeys.includes(cat.key)
+        || state.blessingCullerBlockedCategoryKeys.includes(cat.key)
     ).length;
     const fillableCategories = activeCategories().length - permanentlyBlockedCount;
     return Math.min(limit, Math.max(1, fillableCategories));
@@ -196,8 +240,14 @@ const CAT_BY_KEY = Object.fromEntries(ALL_CATS.map((cat) => [cat.key, cat]));
 // gated perk's bonus quietly does nothing instead of applying anyway.
 function effectiveWildActiveEvery() {
   if (state.wildIndices.length === 0) return 3;
-  const hasFlyer = activePerksOwned().some((p) => p.id === "frequentFlyer");
-  return hasFlyer ? 2 : 3;
+  // Counted, not a bare .some() presence check - a normal purchase caps All
+  // Luck at 1 copy (see its own available()), but Blessing of The Edict can
+  // duplicate it past that ("no stack limit", see renderBlessingEdictPicker())
+  // and each extra copy is meant to keep shortening this by 1 more, same as
+  // its own "Wild Die triggers one round sooner" wording already promises
+  // per copy - floored at 1 (every throw) rather than going to 0 or negative.
+  const flyerCount = activePerksOwned().filter((p) => p.id === "frequentFlyer").length;
+  return Math.max(1, 3 - flyerCount);
 }
 
 function effectiveExtraCatMoneyMultiplier() {
@@ -206,30 +256,38 @@ function effectiveExtraCatMoneyMultiplier() {
   return 1 + count * 0.5;
 }
 
-// How many Make it count copies are still within their 3-game window - each
-// one independently ticks down (see tickMakeItCount) once per game (small
-// or main) it's actually active for, so different copies can be at
-// different points in their own countdown.
+// How many Make it count copies are still within their 2-Boss window - each
+// one independently ticks down (see tickMakeItCount) once per Boss cleared
+// (small games never count, only a main game concluding does - see
+// tickMakeItCount()'s own comment), so different copies can be at different
+// points in their own countdown.
 function activeMakeItCountStacks() {
-  return state.perksOwned.filter((p) => p.id === "makeItCount" && (p.gamesRemaining || 0) > 0).length;
+  return state.perksOwned.filter((p) => p.id === "makeItCount" && (p.bossesRemaining || 0) > 0).length;
 }
 
 // Make it Count's money multiplier per active stack, additive across stacks
 // (2 copies = 1 + 0.5*2 = 2x, not 1.5 squared) - referenced by its own desc
 // text and commitScore()'s money calculation, so both always agree.
 const MAKE_IT_COUNT_MONEY_MULT_PER_STACK = 1;
+// How many Bosses a fresh copy lasts for - see tickMakeItCount()'s own
+// comment for why this counts Bosses only, never a small game.
+const MAKE_IT_COUNT_DURATION_BOSSES = 2;
 
-// Ticks every owned Make it count copy down by one game and drops any that
-// just expired - called once per actual game conclusion: every small game
-// (from showNextRoundPrompt) and every main game (from startNextLevel's
-// main-just-finished branch). Never called for the shop-to-shop phase
-// transitions themselves, so a copy bought in a small-game shop isn't
-// docked a charge for a game that already happened before it existed.
+// Ticks every owned Make it count copy down by one Boss and drops any that
+// just expired - called once per main game conclusion only (from
+// startNextLevel()'s main-just-finished branch), NEVER for a small game
+// (showNextRoundPrompt() deliberately doesn't call this - a small game
+// concluding was previously spending one of its charges too, which read as
+// "lasts 3 games" instead of what the card actually promises: 2 Bosses,
+// regardless of how many small games happen in between them). A copy
+// bought mid-shop isn't docked a charge for a Boss that already happened
+// before it existed, since this only ever fires at the next Boss's own
+// conclusion from here on.
 function tickMakeItCount() {
   state.perksOwned = state.perksOwned.filter((p) => {
     if (p.id !== "makeItCount") return true;
-    p.gamesRemaining -= 1;
-    return p.gamesRemaining > 0;
+    p.bossesRemaining -= 1;
+    return p.bossesRemaining > 0;
   });
 }
 
@@ -241,7 +299,19 @@ function tickFireSale() {
   state.perksOwned = state.perksOwned.filter((p) => {
     if (p.id !== "fireSale") return true;
     p.shopsRemaining -= 1;
-    return p.shopsRemaining > 0;
+    if (p.shopsRemaining > 0) return true;
+    // Vanishing is the trigger for Fire Sale's own "lock the next Small 1
+    // and Small 2 shops after the following Boss" punishment - same arm-
+    // now/consume-at-the-next-boss-conclusion shape as Third Time's the
+    // Charm (see startNextLevel()'s "main just finished" branch and
+    // showNextRoundPrompt()'s own drain), and same "only one cycle at a
+    // time" guard - not that a 2nd Fire Sale could realistically expire
+    // while the first one's lock is still being served anyway (buying a
+    // fresh copy needs an unlocked shop), but kept for consistency.
+    if (!state.fireSalePendingBossLock && state.fireSaleLocksRemaining === 0) {
+      state.fireSalePendingBossLock = true;
+    }
+    return false;
   });
 }
 
@@ -383,20 +453,23 @@ function bestScoreForCategory(key, dice, wildIndices) {
   return best;
 }
 
-// Six-Seven's flat base-score adjustment (+10 Six/Seven of a Kind, -15 Five
-// of a Kind per stack) - applied once to the chosen score, never to a miss
-// (score <= 0 stays a miss) and never below 0 (a nerfed hit still counts as
-// a hit, just for less).
+const SIX_SEVEN_KIND_BONUS = 15;
+const SIX_SEVEN_YATZY_PENALTY = 20;
+
+// Six-Seven's flat base-score adjustment (+SIX_SEVEN_KIND_BONUS Six/Seven of
+// a Kind, -SIX_SEVEN_YATZY_PENALTY Five of a Kind per stack) - applied once
+// to the chosen score, never to a miss (score <= 0 stays a miss) and never
+// below 0 (a nerfed hit still counts as a hit, just for less).
 function applySixSevenBonus(key, score) {
   if (score <= 0) return score;
   const stacks = state.perksOwned.filter((p) => p.id === "sixSeven").length;
   if (stacks === 0) return score;
-  if (key === "sixKind" || key === "sevenKind") return score + 10 * stacks;
-  if (key === "yatzy") return Math.max(0, score - 15 * stacks);
+  if (key === "sixKind" || key === "sevenKind") return score + SIX_SEVEN_KIND_BONUS * stacks;
+  if (key === "yatzy") return Math.max(0, score - SIX_SEVEN_YATZY_PENALTY * stacks);
   return score;
 }
 
-const BASE_POINTS_BONUS = 5;
+const BASE_POINTS_BONUS = 10;
 
 // Each owned Base Points copy locks in its own random target category at
 // pick time (instance.categoryKey) - this sums up +10 per copy whose target
@@ -408,12 +481,24 @@ function basePointsBonusFor(key) {
 
 // Coin Die (see RULE_POOL): each owned instance marked one random die index
 // at one random face value the moment it was picked - pays out
-// COIN_DIE_PAYOUT whenever that exact die is showing that exact face at
-// commit time, independent of category/phase/whether the hand actually
-// scored anything.
+// COIN_DIE_PAYOUT whenever that exact die is showing that exact face AND
+// that face actually contributes to the category being committed (same
+// usedFacesForCategory bar Lucky Die/Blue Die/Streak Die use, wild dice
+// excluded the same way) - previously paid out just for sitting in the
+// tray showing its marked face, whether or not it was part of the
+// committed hand at all; fixed per direct report.
 const COIN_DIE_PAYOUT = 2;
-function coinDieMoneyGain(dice) {
-  return state.perksOwned.filter((p) => p.id === "coinDie" && dice[p.dieIndex] === p.faceValue).length * COIN_DIE_PAYOUT;
+function coinDiePayoutInstances(dice, key, wildIndices) {
+  const usedFaces = usedFacesForCategory(key, dice, wildIndices);
+  return state.perksOwned.filter((p) =>
+    p.id === "coinDie" &&
+    !wildIndices.includes(p.dieIndex) &&
+    dice[p.dieIndex] === p.faceValue &&
+    usedFaces.has(p.faceValue)
+  );
+}
+function coinDieMoneyGain(dice, key, wildIndices) {
+  return coinDiePayoutInstances(dice, key, wildIndices).length * COIN_DIE_PAYOUT;
 }
 
 // Lucky Die (see PERK_POOL): the single owned instance's marked die,
@@ -428,9 +513,13 @@ function luckyDieContributes(instance, key, dice, wildIndices) {
 
 // All Luck (frequentFlyer) adds its own flat bonus to both chances
 // independently - owning it doesn't make the two outcomes any less mutually
-// exclusive per roll, it just widens both slices of the same roll.
+// exclusive per roll, it just widens both slices of the same roll. Counted,
+// not a bare .some() presence check - see effectiveWildActiveEvery()'s own
+// comment for why a Blessing-duplicated 2nd+ copy must still add its own
+// share on top, not just exist as an inert duplicate.
 function luckyDieChances() {
-  const bonus = state.perksOwned.some((p) => p.id === "frequentFlyer") ? LUCKY_DIE_ALL_LUCK_BONUS : 0;
+  const flyerCount = state.perksOwned.filter((p) => p.id === "frequentFlyer").length;
+  const bonus = flyerCount * LUCKY_DIE_ALL_LUCK_BONUS;
   return { money: LUCKY_DIE_MONEY_CHANCE + bonus, double: LUCKY_DIE_DOUBLE_CHANCE + bonus };
 }
 
@@ -458,8 +547,8 @@ function resolveLuckyDie(key, dice, wildIndices) {
 // three of a kind, so several of these can fire on the very same commit.
 const HAND_PAIR_BONUS = 2;
 const HAND_TRIPS_BONUS = 3;
-const HAND_QUADS_BONUS = 4;
-const HAND_STRAIGHT_BONUS = 10;
+const HAND_QUADS_BONUS = 5;
+const HAND_STRAIGHT_BONUS = 15;
 
 function handContainsStraight(dice, wildIndices) {
   return bestScoreForCategory("smallStraight", dice, wildIndices) > 0
@@ -526,19 +615,47 @@ function handPatternBonus(dice, wildIndices) {
 // e.g. 4 real 6s scoring "threeKind" only strictly needs 3 of them, but all
 // 4 still count as used (they share the same face value, so treating one as
 // "unused" would be an arbitrary, meaningless distinction for Leftovers'
+// Finds the best-scoring wild-die face assignment for this category - the
+// exact same brute-force search bestScoreForCategory() itself runs, just
+// returning the winning trial dice array (wild slots filled with their
+// optimal substitute face) instead of only the score. Used by
+// usedFacesForCategory() below so a pattern that only completes WITH a
+// wild's help (e.g. 3 real 6s + 1 wild forming Four of a Kind) still
+// correctly counts the face that actually made it - previously reported
+// live as Streak Die's bonus silently not applying to a hand that could
+// only be thrown using the wild die at all.
+function bestWildAssignment(key, dice, wildIndices) {
+  wildIndices = (wildIndices || []).filter((i) => i < dice.length);
+  if (wildIndices.length === 0) return dice;
+
+  let best = -1;
+  let bestTrial = dice;
+  const trial = [...dice];
+
+  function recurse(pos) {
+    if (pos === wildIndices.length) {
+      const s = computeRawScore(key, trial);
+      if (s > best) { best = s; bestTrial = [...trial]; }
+      return;
+    }
+    for (let face = 1; face <= 6; face++) {
+      trial[wildIndices[pos]] = face;
+      recurse(pos + 1);
+    }
+  }
+  recurse(0);
+  return bestTrial;
+}
+
 // per-face-value bonus below). Chance/Three Pairs/Two Three-of-a-Kinds
 // already sum every die directly into their own score, so every face
 // counts as used for them - crediting leftover dice on top would just
-// double-pay the same dice. Wild dice are excluded from the counts here
-// entirely (their own stale leftover state.dice value shouldn't count
-// toward completing a pattern) - a known simplification: a pattern that
-// only completes WITH a wild's help (e.g. 3 real 6s + 1 wild forming Four
-// of a Kind) reads as "nothing used" by this function even though the
-// category itself does score, so those 3 real 6s would count as unused
-// too. Deemed an acceptable edge case rather than fully reasoning through
-// which specific face a wild "should" be credited toward.
+// double-pay the same dice. Counts are built from bestWildAssignment()'s
+// winning substitution (not a plain exclusion of wild dice - see its own
+// comment for the bug that used to cause), so a real, non-wild die whose
+// face is part of the pattern the wild die completed still reads as used.
 function usedFacesForCategory(key, dice, wildIndices) {
-  const c = counts(dice.filter((_, i) => !wildIndices.includes(i)));
+  const c = counts(bestWildAssignment(key, dice, wildIndices));
   switch (key) {
     case "ones": return new Set(c[1] > 0 ? [1] : []);
     case "twos": return new Set(c[2] > 0 ? [2] : []);
@@ -630,7 +747,9 @@ function unusedDiceSum(key, dice, wildIndices) {
 // reverse.
 function categoryCardMultiplier(key) {
   const cullerBoost = state.cullerBoostedCategoryKeys.includes(key) ? CULLER_CATEGORY_BONUS_STEP : 0;
-  return 1 + (state.categoryBonus[key] || 0) + cullerBoost;
+  const blessingCullerBoost = state.blessingCullerBoostedCategoryKeys.includes(key) ? CULLER_CATEGORY_BONUS_STEP : 0;
+  const blessingGatekeeperBoost = state.blessingGatekeeperBoostedCategoryKeys.includes(key) ? BLESSING_GATEKEEPER_BOOST_MULT : 0;
+  return 1 + (state.categoryBonus[key] || 0) + cullerBoost + blessingCullerBoost + blessingGatekeeperBoost;
 }
 
 // Which score-boosting rule card ids (Base Points, Six-Seven, or a
@@ -796,13 +915,32 @@ function blueDieBonusFor(key, dice, wildIndices) {
     .reduce((sum, p) => sum + dice[p.dieIndex], 0);
 }
 
+// Blessing of The Void (see BLESSING_POOL): each active instance rolled its
+// own favored face at activation time (see renderBlessingVoidRollModal()).
+// Whenever that face is one of the faces usedFacesForCategory() says
+// actually counted toward the committed category (same bar Blue Die uses
+// just above), its own face value gets added to score ONCE PER DIE showing
+// that face (not just once for being present) - e.g. favoring 2 with three
+// 2s in hand pays 2+2+2 = 6, not a flat 2. Boss-only (matches Streak Die's
+// own main-phase-only scope).
+function voidBlessingBonusFor(key, dice, wildIndices) {
+  if (state.phase !== "main") return 0;
+  const usedFaces = usedFacesForCategory(key, dice, wildIndices);
+  return state.activeBlessings
+    .filter((b) => b.id === "blessing_theVoid" && b.favoredFace != null && usedFaces.has(b.favoredFace))
+    .reduce((sum, b) => {
+      const matchingDiceCount = dice.filter((v, i) => !wildIndices.includes(i) && v === b.favoredFace).length;
+      return sum + b.favoredFace * matchingDiceCount;
+    }, 0);
+}
+
 function scoreBreakdownForCategory(key, dice, wildIndices) {
   const baseHit = bestScoreForCategory(key, dice, wildIndices);
   const rawHand = applySixSevenBonus(key, baseHit);
   if (rawHand <= 0) return { rawHand, sixSevenDelta: 0, bonusTotal: 0, blueBonus: 0, base: rawHand, catMult: 1, afterCatMult: rawHand };
   const sixSevenDelta = rawHand - baseHit;
   const bonusTotal = basePointsBonusFor(key) + handPatternBonus(dice, wildIndices).total + leftoversBonusFor(key, dice, wildIndices)
-    + streakDieBonusFor(key, dice, wildIndices);
+    + streakDieBonusFor(key, dice, wildIndices) + voidBlessingBonusFor(key, dice, wildIndices);
   const blueBonus = blueDieBonusFor(key, dice, wildIndices);
   const base = rawHand + bonusTotal + blueBonus;
   const catMult = categoryCardMultiplier(key);
@@ -866,7 +1004,8 @@ const SKIPPER_MULT_STEP = 0.1;
 // live off state every time it's needed (see its xMult(state) function and
 // resolveXMult()), so there's nothing to persist between commits.
 const EMPTY_SLOT_MULT_STEP = 0.4;
-const MINIMALIST_DESC = `Score +${EMPTY_SLOT_MULT_STEP}x Mult per empty perk slot. (Stacks)`;
+const MINIMALIST_BASE_MULT = 0.4;
+const MINIMALIST_DESC = `Starts at +${MINIMALIST_BASE_MULT}x. Score +${EMPTY_SLOT_MULT_STEP}x Mult per empty perk slot. (Stacks)`;
 
 // These 3 growing xMult perks' descriptions are static now - each card's own
 // live current multiplier is already shown on its persistent badge (see
@@ -900,7 +1039,7 @@ const STREAKER_DESC = `Grows +${STREAKER_MULT_STEP}x Mult per streak hand. Reset
 // rather than from a global one-off event like a delete/skip. Still only
 // ever APPLIES on that same kind of commit (xMultCondition below, unchanged
 // from before) - growing it doesn't make it start affecting other hands too.
-const STRAIGHT_SHOT_MULT_STEP = 0.2;
+const STRAIGHT_SHOT_MULT_STEP = 0.15;
 const STRAIGHT_SHOT_DESC = `Permanently adds +${STRAIGHT_SHOT_MULT_STEP}x Mult per Straight scored. Score by committing a Straight. (Stacks)`;
 
 // Lowball's own xMult isn't stored/grown either - same live-read-off-state
@@ -1000,6 +1139,11 @@ function useMulligan() {
   // whatever hand is being undone, so it shouldn't be reverted away either.
   const liveThirdTimesCharmPendingBossLock = state.thirdTimesCharmPendingBossLock;
   const liveThirdTimesCharmLocksRemaining = state.thirdTimesCharmLocksRemaining;
+  // Fire Sale: same reasoning as Third Time's the Charm's own pair just
+  // above - a lock this shop already armed (or is already draining) by
+  // Fire Sale running out predates whatever hand is being undone.
+  const liveFireSalePendingBossLock = state.fireSalePendingBossLock;
+  const liveFireSaleLocksRemaining = state.fireSaleLocksRemaining;
   state = mulliganSnapshot;
   mulliganSnapshot = null;
   if (state.phase === "main") {
@@ -1012,6 +1156,8 @@ function useMulligan() {
     state.shopPurchasesLocked = liveShopPurchasesLocked;
     state.thirdTimesCharmPendingBossLock = liveThirdTimesCharmPendingBossLock;
     state.thirdTimesCharmLocksRemaining = liveThirdTimesCharmLocksRemaining;
+    state.fireSalePendingBossLock = liveFireSalePendingBossLock;
+    state.fireSaleLocksRemaining = liveFireSaleLocksRemaining;
   }
   state.dice = freshDice(diceCount);
   state.dieRotation = freshDieRotations(diceCount);
@@ -1071,7 +1217,7 @@ const PERK_POOL = [
   {
     id: "extraPerkSlot",
     name: "Extra Perk",
-    desc: "Unlocks a new Perk slot.",
+    desc: `Unlocks a new Perk slot. ${formatPercent(EXTRA_PERK_GUARANTEE_CHANCE)} chance to appear when all perk slots are full.`,
     stacks: true,
     // Doesn't render its own card (see renderPerks) - it only raises how
     // many slots effectivePerkSlotCount() reports, computed live from how
@@ -1126,7 +1272,7 @@ const PERK_POOL = [
   {
     id: "easyTarget",
     name: "Steady Nerves",
-    desc: "Slows target growth each level by -3%. 20% normally. (Stacks up to 2 times)",
+    desc: "Slows target growth each level by -3%. (Stacks up to 2 times)",
     stacks: STEADY_NERVES_MAX_STACKS,
     // Only worth offering once you don't already have the max 2 stacks.
     available(state) { return stackAvailable(state, "easyTarget", STEADY_NERVES_MAX_STACKS); },
@@ -1284,10 +1430,14 @@ const PERK_POOL = [
     // it's needed (see resolveXMult()) rather than stored/grown on the
     // instance, since "how many slots are empty right now" can change from
     // any perk pick/delete/replace, not just this card's own actions.
+    // isNormalSlotPerk, not isSlotOccupyingPerk - a Shiny perk's own slot
+    // lives entirely outside effectivePerkSlotCount()'s cap now (see its
+    // own comment), so it must be excluded from "occupied" here too, or
+    // owning one would wrongly look like it ate an empty NORMAL slot.
     xMult(state) {
-      const occupied = state.perksOwned.filter(isSlotOccupyingPerk).length;
+      const occupied = state.perksOwned.filter(isNormalSlotPerk).length;
       const empty = Math.max(0, effectivePerkSlotCount() - occupied);
-      return Math.round(EMPTY_SLOT_MULT_STEP * empty * 100) / 100;
+      return Math.round((MINIMALIST_BASE_MULT + EMPTY_SLOT_MULT_STEP * empty) * 100) / 100;
     },
     xMultCondition() { return true; },
     apply() {},
@@ -1429,7 +1579,7 @@ const RULE_POOL = [
   {
     id: "cleanSlate",
     name: "Clean Slate",
-    desc: "Removes a random owned perk. Pays $20 per perk card you currently own.",
+    desc: "Removes a random owned non-Shiny perk. Pays $20 per perk card you currently own.",
     persistent: false,
     stacks: false, // instant one-shot effect, no owned instance to accumulate
     apply(state) {
@@ -1440,13 +1590,16 @@ const RULE_POOL = [
       // got randomly destroyed" either, same reasoning as
       // isEdictDestroyablePerk()'s own exclusion. Payout is based on how
       // many perk cards were owned before this one gets removed - shielded
-      // ones still count toward it (you still own the card), they just
-      // can't be the one actually picked below.
+      // AND Shiny ones still count toward it (you still own the card),
+      // they just can't be the one actually picked below.
       const removableIndices = state.perksOwned
         .map((p, i) => i)
         .filter((i) => isSlotOccupyingPerk(state.perksOwned[i]));
       state.money += 20 * removableIndices.length;
-      const destroyableIndices = removableIndices.filter((i) => !state.perksOwned[i].shielded);
+      // Shiny perks are off-limits to every one of the red destructive rule
+      // cards (Clean Slate/Selective Cut/Ooo Shiny) - see DESTRUCTIVE_RULE_IDS's
+      // own comment.
+      const destroyableIndices = removableIndices.filter((i) => !state.perksOwned[i].shielded && !state.perksOwned[i].shiny);
       if (destroyableIndices.length > 0) {
         removePerkInstance(destroyableIndices[Math.floor(Math.random() * destroyableIndices.length)]);
       }
@@ -1455,7 +1608,7 @@ const RULE_POOL = [
   {
     id: "selectiveCut",
     name: "Selective Cut",
-    desc: "Choose one owned perk to remove. Gain $40.",
+    desc: "Choose one owned non-Shiny perk to remove. Gain $40.",
     persistent: false,
     needsPerkSelection: true,
     stacks: false, // instant one-shot effect, no owned instance to accumulate
@@ -1469,7 +1622,7 @@ const RULE_POOL = [
   {
     id: "oooShiny",
     name: "Ooo Shiny",
-    desc: "Randomly destroys half of your owned perks. Uneven amount rounds down. Destroys max 3 Perks. Lets you choose one of the survivors to make shiny.",
+    desc: "Randomly destroys half of your owned non-Shiny perks. Uneven amount rounds down. Destroys max 3 Perks. Lets you choose one of the survivors to make shiny.",
     persistent: false,
     needsPerkSelection: true,
     // Each pick genuinely can turn a different perk shiny (and costs more
@@ -1513,10 +1666,10 @@ const RULE_POOL = [
     id: "makeItCount",
     name: "Make it count",
     tint: "pink",
-    desc: `Multiplies the money earned from every hand scored in a small game by ${1 + MAKE_IT_COUNT_MONEY_MULT_PER_STACK}x per active copy, but the main game gets 2 fewer turns. Lasts 3 games. (Stacks)`,
+    desc: `Multiplies the money earned from every hand scored in a small game by ${1 + MAKE_IT_COUNT_MONEY_MULT_PER_STACK}x per active copy, but the main game gets 2 fewer turns. Lasts ${MAKE_IT_COUNT_DURATION_BOSSES} Bosses - small games in between don't count against it. (Stacks)`,
     persistent: true,
     stacks: true,
-    apply(state, instance) { instance.gamesRemaining = 3; },
+    apply(state, instance) { instance.bossesRemaining = MAKE_IT_COUNT_DURATION_BOSSES; },
     remove() {}, // both effects are recomputed live from perksOwned, nothing to reverse
   },
   {
@@ -1539,7 +1692,7 @@ const RULE_POOL = [
     id: "fireSale",
     name: "Fire Sale",
     tint: "pink",
-    desc: `Every Card Pack in the shop is ${formatPercent(FIRE_SALE_DISCOUNT)} cheaper for the next ${FIRE_SALE_SHOPS} shops (the one you're in now counts as the first).`,
+    desc: `Every Card Pack in the shop is ${formatPercent(FIRE_SALE_DISCOUNT)} cheaper for the next ${FIRE_SALE_SHOPS} shops (the one you're in now counts as the first). Once card disappears, the next shops after the Boss are locked.`,
     persistent: true,
     stacks: false, // presence-only check (some()) - a 2nd copy risks pushing the discount past 100%
     available(state) { return stackAvailable(state, "fireSale", 1); },
@@ -1550,7 +1703,7 @@ const RULE_POOL = [
     id: "highStakes",
     name: "High Stakes",
     tint: "pink",
-    desc: "Adds 2% to the main game's per-level target growth rate (e.g. 20% becomes 22%, stacks). Doubles your money right now.",
+    desc: "Adds 1% to the main game's per-level target GROWTH RATE (20% becomes 21%) - not a flat bump to any one target. It compounds every level, so it snowballs over a full run (one copy alone makes level 25's target ~20% higher). Stacks. Doubles your money right now.",
     persistent: true,
     stacks: true,
     apply(state) {
@@ -1561,7 +1714,7 @@ const RULE_POOL = [
     id: "coinDie",
     name: "Coin Die",
     tint: "pink",
-    desc: `Adds a coin to a random die face. Commit a hand with coin and gain $${COIN_DIE_PAYOUT}. (Stacks)`,
+    desc: `Adds a coin to a random die face. Commit a hand where the coin face is a part of the hand and gain $${COIN_DIE_PAYOUT}. (Stacks)`,
     persistent: true,
     stacks: true,
     apply(state, instance) {
@@ -1574,7 +1727,7 @@ const RULE_POOL = [
     id: "luckyDie",
     name: "Lucky Die",
     tint: "pink",
-    desc: `Marks one random die Lucky. Any hand it contributes to has a ${formatPercent(LUCKY_DIE_MONEY_CHANCE)} chance to pay $${LUCKY_DIE_MONEY_AMOUNT}, and a separate ${formatPercent(LUCKY_DIE_DOUBLE_CHANCE)} chance to double the whole final score. (Does not stack)`,
+    desc: `Marks one random die Lucky. Any hand it contributes to has a ${formatPercent(LUCKY_DIE_MONEY_CHANCE)} chance to pay $${LUCKY_DIE_MONEY_AMOUNT}, and a separate ${formatPercent(LUCKY_DIE_DOUBLE_CHANCE)} chance to double the whole final score. Works on Bosses and Small Games. (Does not stack)`,
     persistent: true,
     stacks: false, // presence-only check (some()), a 2nd copy would do nothing more
     available(state) { return stackAvailable(state, "luckyDie", 1); },
@@ -1619,12 +1772,24 @@ const RULE_POOL = [
   {
     id: "blueDie",
     name: "Blue Die",
-    desc: "Paints one die's dots dark blue. Commit a hand with that die contributing, and its face value gets added to your score too. (Stacks up to 3 times)",
+    desc: "Paints one die's face blue. Commit a hand with that die contributing, and its face value gets added to your score too. (Stacks up to 3 times)",
     persistent: true,
     stacks: 3,
     available(state) { return stackAvailable(state, "blueDie", 3); },
     apply(state, instance) {
-      instance.dieIndex = Math.floor(Math.random() * state.diceCount);
+      // Excludes dice an earlier stack already painted - a plain unconditional
+      // random pick could otherwise land a 2nd/3rd copy on the SAME die
+      // index as one already owned, silently wasting that copy (its own
+      // dieIndex, name, and score contribution are all real and counted -
+      // see blueDieBonusFor() - but paintDieBlue() only marks a die blue by
+      // presence of ANY matching instance, so two stacks sharing one index
+      // never show as two blue dice, just one). Falls back to the full
+      // unrestricted range only in the (essentially impossible at a 3-stack
+      // cap) case every die is already taken.
+      const usedIndices = new Set(state.perksOwned.filter((p) => p.id === "blueDie").map((p) => p.dieIndex));
+      const freeIndices = Array.from({ length: state.diceCount }, (_, i) => i).filter((i) => !usedIndices.has(i));
+      const pool = freeIndices.length > 0 ? freeIndices : Array.from({ length: state.diceCount }, (_, i) => i);
+      instance.dieIndex = pool[Math.floor(Math.random() * pool.length)];
     },
     remove() {}, // bonus already banked into any past scores stays banked, nothing to reverse
   },
@@ -1672,7 +1837,7 @@ const RULE_POOL = [
   {
     id: "sixSeven",
     name: "Six-Seven",
-    desc: "Adds +10 points to Six of a Kind and Seven of a Kind. Lowers Five of a Kind's score by 15. (Stacks)",
+    desc: `Adds +${SIX_SEVEN_KIND_BONUS} points to Six of a Kind and Seven of a Kind. Lowers Five of a Kind's score by ${SIX_SEVEN_YATZY_PENALTY}. (Stacks)`,
     persistent: true,
     stacks: true,
     apply() {}, // effect is recomputed live from perksOwned in applySixSevenBonus()
@@ -1710,7 +1875,7 @@ const RULE_POOL = [
     id: "thirdTimesTheCharm",
     name: "Third Time's the Charm",
     tint: "blue",
-    desc: `3rd Set of shops offer all packs -${formatPercent(THIRD_TIMES_CHARM_DISCOUNT)} for the rest of the game. But the next shops after Boss are locked.`,
+    desc: `3rd Set of shops offer all packs -${formatPercent(THIRD_TIMES_CHARM_DISCOUNT)} for the rest of the game. But locks the next Small 1 and Small 2 shops after the following Boss.`,
     persistent: true,
     stacks: false, // presence-only check (some()), a 2nd copy would do nothing more
     available(state) { return stackAvailable(state, "thirdTimesTheCharm", 1); },
@@ -1732,6 +1897,9 @@ const RULE_POOL = [
 
 // Rule cards that remove one of your own perks - visually flagged red
 // wherever they're shown so their destructive cost is obvious at a glance.
+// None of the three can ever target a Shiny perk (random OR deliberate
+// pick alike) - a Shiny card, and the always-exactly-matched bonus slot
+// that comes with it, are simply off-limits to all of them.
 const DESTRUCTIVE_RULE_IDS = ["cleanSlate", "selectiveCut", "oooShiny"];
 
 // Rule cards capped at a single copy (see each one's own available():
@@ -1777,12 +1945,15 @@ function isDoubleTarget(key) {
 // or Nothing".
 const HOTLINE_MULTIPLIER = 1.5;
 
-// All Luck no longer stacks at all (see its PERK_POOL entry) - a 2nd copy
-// can't even be owned, but this stays a presence check (some()) rather than
-// a flat +1, matching how the card is defined everywhere else.
+// All Luck doesn't stack through a normal purchase (a 2nd copy can't be
+// offered - see its own available()), but Blessing of The Edict can still
+// duplicate it past that ("no stack limit", see renderBlessingEdictPicker())
+// - counted here, not a bare .some() presence check, so each extra copy
+// keeps adding its own +1 category on top instead of the duplicate just
+// sitting there doing nothing.
 function doubleOrNothingTargetCount() {
   const donCount = activePerksOwned().filter((p) => p.id === "doubleOrNothing").length;
-  const flyerBonus = activePerksOwned().some((p) => p.id === "frequentFlyer") ? 1 : 0;
+  const flyerBonus = activePerksOwned().filter((p) => p.id === "frequentFlyer").length;
   return donCount + flyerBonus;
 }
 
@@ -1937,6 +2108,13 @@ const MAIN_GAME_MODIFIERS = [
 const BOSS_BLOCKABLE_PERK_IDS = [
   "moneyHand", "sixthSense", "frequentFlyer", "doubleOrNothing",
   "firstInstinct", "demolisher", "skipper", "minimalist", "streaker", "uppercut", "milestone",
+  // Streak Die's own bonus lives on the instance and is read fresh every
+  // commit (see streakDieBonusFor()), same shape as Demolisher/Skipper/
+  // Streaker just above - it was simply missing from here before, which
+  // also meant Blessing of The Censor (see duplicateEligiblePerkForBlessingCensor(),
+  // which reuses this exact list) could never pick it as a duplication
+  // target at all.
+  "streakDie",
 ];
 
 // Deliberately does NOT check p.shielded - a Perk Shield Token protects a
@@ -2001,6 +2179,48 @@ function pickNewCensorTarget() {
   state.bossBlockedPerkInstanceId = pool[Math.floor(Math.random() * pool.length)].instanceId;
 }
 
+// Blessing of The Censor (see activateUsable()) - picks one random eligible
+// perk (BOSS_BLOCKABLE_PERK_IDS scope, same as isBossBlockablePerk() uses,
+// PLUS Mulligan - see below for why that one's a special case - excluding
+// whichever instance the real Censor is currently silencing, if any -
+// duplicating a perk that's simultaneously silenced would be a confusing
+// wash) and pushes a real, independent, identical copy of it straight into
+// state.perksOwned - a live snapshot of its current stats (xMult included),
+// not a link that keeps tracking the original afterward. Tagged
+// blessingCensorDuplicate so it can be found again once the round ends
+// (see startNextLevel()'s carry.perksOwned filter) and so
+// effectivePerkSlotCount() can grow to fit it even with slots already
+// full, same "brings its own extra slot" treatment a shiny copy gets.
+function duplicateEligiblePerkForBlessingCensor() {
+  const blockedId = currentlyBlockedPerkInstanceId();
+  const eligiblePerks = state.perksOwned.filter((p) =>
+    (isBossBlockablePerk(p) || p.id === "mulligan") && p.instanceId !== blockedId
+  );
+  if (eligiblePerks.length === 0) return;
+  const target = eligiblePerks[Math.floor(Math.random() * eligiblePerks.length)];
+  state.perksOwned.push({ ...target, instanceId: state.nextPerkInstanceId++, blessingCensorDuplicate: true });
+  // Hotline (doubleOrNothing) and All Luck (frequentFlyer, which grows its
+  // target count by 1) both bake their live effect into state.doubleTargets,
+  // only re-picked at actual turn boundaries (see rerollDoubleTarget()) -
+  // without this, duplicating either mid-turn would leave the scorecard's
+  // "doubled" highlight showing the stale pre-duplicate target list until
+  // the next throw/commit, even though the duplicate is already live and
+  // counted everywhere else that reads it (activePerksOwned()).
+  if (target.id === "doubleOrNothing" || target.id === "frequentFlyer") rerollDoubleTarget();
+  // Mulligan isn't in BOSS_BLOCKABLE_PERK_IDS (it's a one-time-use ability
+  // with no ongoing effect for a boss to silence, not the "read fresh every
+  // time" shape that list is actually scoped to), and its own "used" flag
+  // is a single flat per-phase-pair boolean (mulliganAvailable()), never
+  // tracked per owned instance - so a 2nd copy would otherwise just sit
+  // there doing nothing at all. Duplicating it here specifically regrants
+  // a fresh use instead, matching what owning "another Mulligan" should
+  // intuitively mean.
+  if (target.id === "mulligan") {
+    if (state.phase === "main") state.mulliganUsedThisBoss = false;
+    else state.mulliganUsedThisSmallPair = false;
+  }
+}
+
 // state.perksOwned with whichever single instance is currently boss-
 // silenced removed - every scoring/money/wild-selection check that should
 // respect a "perk" boss reads through this instead of state.perksOwned
@@ -2039,18 +2259,42 @@ function activeBossModifier() {
 // live in state.usablesOwned and are listed in the sidebar's "Usables"
 // panel (renderUsableInventory()), where clicking an activatable one spends
 // it immediately (see activateUsable()).
+// Each SKU's own cost is substituted in below, so Blessing (2) only ever
+// shows "Cost $20" (never mentions $25, and vice versa for Blessing (3)).
+const blessingPackDesc = (cost) => `Select a one time use Blessing. Usable on any boss. Cost $${cost}`;
+
 const USABLE_POOL = [
+  {
+    id: "blessing2",
+    name: "Blessing (2)",
+    desc: blessingPackDesc(20),
+    cost: 20,
+    cardCount: 2,
+    // Unlike every other entry here, never added to state.usablesPurchasedIds
+    // (see buyBossUsable()) - stays eligible for pickRandomUsableId() forever
+    // instead of being excluded after the first buy, so it can be bought
+    // over and over in the same run.
+    repeatable: true,
+  },
+  {
+    id: "blessing3",
+    name: "Blessing (3)",
+    desc: blessingPackDesc(25),
+    cost: 25,
+    cardCount: 3,
+    repeatable: true,
+  },
   {
     id: "bossSkipToken",
     name: "Boss Skip Token",
-    desc: "Activate before your first throw in a Boss to skip its effect for the rest of the level, as if no Boss modifier were active at all.",
-    cost: 40,
+    desc: "Activate to skip current Boss effect",
+    cost: 30,
   },
   {
     id: "freeRerollToken",
     name: "Free Reroll Token",
-    desc: "Activate during a Card Pack shop to make its next Refresh cost $0. Comes with 3 uses - spent one at a time, removed once all 3 are gone.",
-    cost: 20,
+    desc: "Activate during a shop to make next Refresh cost $0. Comes with 3 uses",
+    cost: 15,
     // Starting charge count for a freshly-bought instance (see
     // buyBossUsable()) - NOT itself a live count, that lives on the owned
     // instance (instance.charges, decremented by activateUsable()).
@@ -2059,22 +2303,138 @@ const USABLE_POOL = [
   {
     id: "doubleDownToken",
     name: "Double Down Token",
-    desc: "Activate any time to double whatever score your very next committed hand banks.",
-    cost: 15,
+    desc: "Activate to double your next committed hands score.",
+    cost: 10,
   },
   {
     id: "perkRerollToken",
     name: "Perk Reroll Token",
-    desc: "Activate to pick one owned perk and reroll it into a random new one.",
+    desc: "Activate to reroll one selected perk into a random new one.",
     cost: 15,
   },
   {
     id: "perkShieldToken",
     name: "Perk Shield Token",
-    desc: "Activate to pick one owned perk and shield it. Clean Slate and Ooo Shiny can no longer randomly destroy it - deliberate removal (The Edict, Selective Cut, trashing it, or replacing it with another perk) still can.",
-    cost: 30,
+    desc: "Activate to pick one owned perk and shield it. It can no longer be randomly destroyed by a rule card",
+    cost: 10,
+  },
+  {
+    id: "xMultUpgradeToken",
+    name: "X Mult Perk Upgrade Token",
+    desc: "Adds +0.75x mult to any perk you choose.",
+    cost: 20,
   },
 ];
+
+// Blessing's own card pool (see USABLE_POOL's "blessing" entry and
+// activateUsable()) - one card per boss (see MAIN_GAME_MODIFIERS), each
+// reversing that boss's own debuff into a buff. Picked cards go into
+// state.usablesOwned like any other usable (see pickBlessingCard()), listed
+// in the Usables sidebar and activated the same way (click to spend it) -
+// activating one moves it into state.activeBlessings for the rest of the
+// CURRENT round only (that field is deliberately left out of
+// startNextLevel()'s carry object, so it's wiped the instant the round
+// ends, same "one round" lifetime every effect below assumes via
+// hasBlessing()). The Edict is the one exception - its effect is a single
+// immediate action (duplicate a chosen perk), not an ongoing one, so it's
+// resolved on the spot and never added to activeBlessings at all (see
+// activateUsable()). tintClass mirrors renderBosses()' own boss.tint/
+// category coloring, so a Blessing card always matches that boss's own
+// color. Bosses with no card yet (or one deliberately removed - The
+// Warden/The Tempest/The Vice are hard to reverse meaningfully, The
+// Turnkey has no design yet, and The Weight was pulled) return null from
+// the switch below and are filtered out entirely, rather than sitting in
+// the pool as an empty placeholder.
+const BLESSING_POOL = MAIN_GAME_MODIFIERS.map((boss) => {
+  const tintClass = boss.tint ? `tint-${boss.tint}` : (boss.category !== "dice" ? `category-${boss.category}` : "");
+  const base = { id: `blessing_${boss.id}`, name: `Blessing of ${boss.title}`, tintClass };
+  switch (boss.id) {
+    case "theVoid":
+      return {
+        ...base,
+        desc: "Roll one die to find out which face this Blessing favors. For the rest the round, its value is added to your score for every die showing that face in a committed hand.",
+      };
+    case "theCensor":
+      return {
+        ...base,
+        desc: "Duplicates one random perk as a real, identical copy in your perk slots. Stays for the rest of that round.",
+      };
+    case "theEdict":
+      return {
+        ...base,
+        desc: "Choose one owned perk to duplicate. Creates a fresh copy, bypassing its normal max-stack limit. That perk stays with you for as long as you want.\nNo empty Perk slot required.",
+      };
+    case "theGatekeeper":
+      return {
+        ...base,
+        desc: "For the rest of the round, every turn 3 random unfilled categories grant +2x if committed that turn. Backs off once only 5 turns remain in the level.",
+      };
+    case "theCuller":
+      return {
+        ...base,
+        desc: "Removes your 2 least-boosted categories from play that round. Every other category is raised by +0.2x in exchange.",
+      };
+    case "theTaxman":
+      return {
+        ...base,
+        desc: "Leftover throws convert to money at 3x the normal rate.",
+      };
+    case "theLandlord":
+      return {
+        ...base,
+        desc: "For the rest of that round, gives you $2 after every turn.",
+      };
+    case "theHourglass":
+      return {
+        ...base,
+        desc: "Immediately adds 2 turns to that round's turn limit.",
+      };
+    case "theUndertaker":
+      return {
+        ...base,
+        desc: "For the rest of that round, every other turn gives one extra reroll.",
+      };
+    case "theThief":
+      return {
+        ...base,
+        desc: "Adds one extra die for the rest of that round.",
+      };
+    default:
+      // The Warden/The Tempest/The Vice/The Turnkey - no effect decided
+      // yet; The Weight - removed. Filtered out below.
+      return null;
+  }
+}).filter(Boolean);
+
+// Shared "is this Blessing currently active for the round" check - every
+// Blessing effect below is gated through this instead of reading
+// state.activeBlessings directly, so there's one call site if that ever
+// needs to change.
+function hasBlessing(id) {
+  return state.activeBlessings.some((b) => b.id === id);
+}
+
+const BLESSING_HOURGLASS_TURNS = 2;
+const BLESSING_UNDERTAKER_BONUS_REROLLS = 1;
+const BLESSING_THIEF_DICE_BONUS = 1;
+const BLESSING_LANDLORD_GAIN_PER_TURN = 2;
+const BLESSING_TAXMAN_MULTIPLIER = 3;
+const BLESSING_GATEKEEPER_BOOST_COUNT = 3;
+const BLESSING_GATEKEEPER_BOOST_MULT = 2;
+const BLESSING_CULLER_REMOVE_COUNT = 2;
+
+// Samples n distinct Blessing cards for a fresh offer (see activateUsable())
+// - same Fisher-Yates-then-slice shuffle every other sampleXIds() helper in
+// this file uses. Naturally yields fewer than n (down to 0) if BLESSING_POOL
+// doesn't have n entries yet.
+function sampleBlessingIds(n) {
+  const shuffled = [...BLESSING_POOL];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, n).map((b) => b.id);
+}
 
 // Picks which USABLE_POOL item the boss shop slot will offer - used both by
 // newRunState() (the very first boss the run will ever reach) and
@@ -2106,6 +2466,41 @@ function pickRandomUsableId(purchasedIds) {
 // shared by the sidebar panel (to grey out a not-yet-usable card) and
 // activateUsable() itself (the actual gate).
 function usableActivatable(item) {
+  if (item.id === "blessing2" || item.id === "blessing3") {
+    // No boss/shop restriction, same reasoning as Perk Reroll/Shield Token
+    // below - opens its own pack-offer modal (see activateUsable()), just
+    // needs no modal already in the way and no other pack offer pending.
+    return !state.gameOver && !state.pendingPackOffer && modalOverlay.classList.contains("hidden");
+  }
+  if (item.id === "blessing_theEdict") {
+    // Unlike every other owned Blessing card, this one's effect is never
+    // added to state.activeBlessings - it duplicates a perk immediately
+    // and permanently, fully resolved the instant it's picked (see
+    // renderBlessingEdictPicker()), with nothing scoped to "the rest of
+    // this Boss round" the way the other Blessings below actually are. So
+    // it skips their main-phase-only gate and works in small games too.
+    if (state.pendingPackOffer || !modalOverlay.classList.contains("hidden")) return false;
+    // Same "nothing eligible to offer" gate the real Edict's own
+    // mandatory picker uses (renderEdictPicker()) - opening the picker
+    // with nothing clickable in it would be a dead end.
+    return state.perksOwned.some(isEdictDestroyablePerk);
+  }
+  if (item.id.startsWith("blessing_")) {
+    // An owned Blessing card (won from opening a Blessing pack) - only
+    // meaningful, and only activatable, while an actual Boss is in
+    // progress, since its effect only ever lasts the rest of that one
+    // round (see state.activeBlessings).
+    if (state.phase !== "main" || state.pendingPackOffer || !modalOverlay.classList.contains("hidden")) return false;
+    if (item.id === "blessing_theCensor") {
+      // Same eligibility scope duplicateEligiblePerkForBlessingCensor()
+      // itself picks from - without this gate, activating with nothing
+      // eligible owned was a silent no-op (that function's own early
+      // return), spending the card's activation for literally nothing.
+      const blockedId = currentlyBlockedPerkInstanceId();
+      return state.perksOwned.some((p) => isBossBlockablePerk(p) && p.instanceId !== blockedId);
+    }
+    return true;
+  }
   if (item.id === "bossSkipToken") {
     return state.phase === "main" && !state.rolled && !state.bossEffectSkipped && activeBossModifier() != null;
   }
@@ -2142,6 +2537,13 @@ function usableActivatable(item) {
     return !state.gameOver && modalOverlay.classList.contains("hidden")
       && state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded);
   }
+  if (item.id === "xMultUpgradeToken") {
+    // Same scope/restrictions as Perk Reroll Token above, narrowed to
+    // owned perks that actually have an xMult at all (a plain number or a
+    // function - see resolveXMult()) - nothing to upgrade otherwise.
+    return !state.gameOver && modalOverlay.classList.contains("hidden")
+      && state.perksOwned.some((p) => isSlotOccupyingPerk(p) && typeof p.xMult !== "undefined");
+  }
   return false;
 }
 
@@ -2166,10 +2568,125 @@ function activateUsable(instanceId) {
 
   let spent = true; // whether this activation uses up the instance entirely
 
-  if (item.id === "bossSkipToken") {
+  if (item.id === "blessing2" || item.id === "blessing3") {
+    // Not spent here - opens a Card Pack-style offer instead (same deferred-
+    // spend pattern as Perk Reroll/Shield Token below), only actually
+    // removed from usablesOwned once that offer resolves - see
+    // resolveBlessingOffer(). Card count matches which SKU this is (see
+    // USABLE_POOL's own cardCount field) - Blessing (2) always 2, Blessing
+    // (3) always 3, no longer a 50/50 roll.
+    spent = false;
+    state.pendingBlessingInstanceId = instanceId;
+    state.pendingPackKind = "blessing";
+    const blessingPackDef = USABLE_POOL.find((u) => u.id === item.id);
+    state.pendingPackOffer = sampleBlessingIds(blessingPackDef.cardCount);
+    state.pendingPackBoostedKeys = [];
+    state.pendingPackShinyKeys = [];
+    state.pendingPackIsMega = false;
+    pendingPackFlipIn = true;
+    showPackOfferModal();
+  } else if (item.id.startsWith("blessing_")) {
+    // Spent immediately below (the generic `if (spent)` splice at the
+    // bottom of this function) - unlike the pack above, there's no
+    // multi-step "offer" to resolve first, just this one card's own effect
+    // kicking in right now, for the rest of the current round.
+    if (item.id === "blessing_theEdict") {
+      // Not spent here - opens its own picker instead (same deferred-spend/
+      // Back-button pattern as Perk Reroll/Shield Token below), only
+      // actually removed from usablesOwned once a perk is actually picked
+      // to duplicate (see renderBlessingEdictPicker()). Never added to
+      // state.activeBlessings at all (see BLESSING_POOL's own comment) -
+      // the perk it duplicates is a real, separate, permanent instance
+      // with its own independent lifetime.
+      spent = false;
+      renderBlessingEdictPicker(instanceId);
+    } else if (item.id === "blessing_theCuller") {
+      // Also a one-time action (which 2 categories get removed is decided
+      // once, right now, not re-evaluated every turn) - still added to
+      // activeBlessings so it shows as active for the rest of the round
+      // like every other Blessing, even though its own effect already
+      // fully resolved via the call below.
+      state.activeBlessings.push({ id: item.id });
+      applyBlessingCullerEffect();
+    } else if (item.id === "blessing_theThief") {
+      state.activeBlessings.push({ id: item.id });
+      state.diceCount += BLESSING_THIEF_DICE_BONUS;
+      resizeDiceArraysToCount(state.diceCount);
+    } else if (item.id === "blessing_theVoid") {
+      const activeInstance = { id: item.id, favoredFace: null };
+      state.activeBlessings.push(activeInstance);
+      renderBlessingVoidRollModal(activeInstance, () => {
+        hideModal();
+        renderAll();
+        saveState();
+      });
+    } else if (item.id === "blessing_theCensor") {
+      // Also a one-time action now - a real, permanent-looking duplicate
+      // perk instance (see duplicateEligiblePerkForBlessingCensor()) is
+      // created immediately and shows up in the perk slots right away,
+      // rather than a computed phantom re-picked every turn.
+      state.activeBlessings.push({ id: item.id });
+      duplicateEligiblePerkForBlessingCensor();
+    } else if (item.id === "blessing_theGatekeeper") {
+      state.activeBlessings.push({ id: item.id });
+      // Picks this turn's boosted categories right now instead of waiting
+      // for the next turn-advance (see commitScore()'s own re-pick) - same
+      // "kicks in instantly" treatment as Culler above.
+      refreshBlessingGatekeeperBoosts();
+    } else if (item.id === "blessing_theUndertaker") {
+      // Its own "every other turn" parity is measured relative to
+      // activatedOnTurn (see totalThrowsAllowed()), not state.turn's raw
+      // parity - so THIS turn (whichever one it's activated on) always
+      // counts as the first "on" turn, instead of possibly landing on an
+      // "off" turn and doing nothing until the next one.
+      state.activeBlessings.push({ id: item.id, activatedOnTurn: state.turn });
+    } else if (item.id === "blessing_theHourglass") {
+      if (state.diceCount <= 5) {
+        // No Extra Dice - the +2 turns would be entirely wasted (see
+        // turnLimit()'s own fillable-categories cap, which caps the level
+        // back down to however many categories actually exist regardless)
+        // - confirm before spending the activation on it. Not spent here -
+        // see renderBlessingHourglassConfirm()'s own Activate handler.
+        spent = false;
+        renderBlessingHourglassConfirm(instanceId);
+      } else {
+        state.activeBlessings.push({ id: item.id });
+      }
+    } else {
+      // Every other Blessing (Taxman/Landlord) is a purely live-recomputed
+      // effect - just being listed here is enough, every relevant function
+      // (chargeLandlordRent(), showTurnsLeftBonusCue(), etc.) already reads
+      // hasBlessing() fresh on every call.
+      state.activeBlessings.push({ id: item.id });
+    }
+  } else if (item.id === "bossSkipToken") {
     if (activeBossModifier()?.id === "theThief") {
       state.diceCount += 1;
       resizeDiceArraysToCount(state.diceCount);
+    }
+    // The Culler's own removal/boost is baked into state ONCE at level
+    // start (see applyCullerEffect(), called from startNextLevel()) rather
+    // than re-checked live against activeBossModifier() the way most other
+    // boss effects are - categoryIsBlocked()/categoryCardMultiplier() read
+    // state.cullerBlockedCategoryKeys/cullerBoostedCategoryKeys directly,
+    // with no "is Culler still active" gate of their own. Nulling
+    // activeBossModifier() below (via bossEffectSkipped) alone would leave
+    // both categories permanently blocked/boosted regardless, same
+    // "baked-in effect needs its own explicit undo" reasoning
+    // activeBossModifier()'s own comment already calls out for The
+    // Thief's stolen die above.
+    if (activeBossModifier()?.id === "theCuller") {
+      state.cullerBlockedCategoryKeys = [];
+      state.cullerBoostedCategoryKeys = [];
+    }
+    // The Gatekeeper's own block list has the same issue, one level
+    // shallower - refreshGatekeeperBlocks() DOES already clear it once the
+    // boss isn't Gatekeeper, but that function only ever runs again at the
+    // next turn boundary (see startNextLevel()/commitScore()), not the
+    // instant this token is used - without this, the categories it
+    // blocked for the CURRENT turn stay blocked until then.
+    if (activeBossModifier()?.id === "theGatekeeper") {
+      state.gatekeeperBlockedCategoryKeys = [];
     }
     state.bossEffectSkipped = true;
   } else if (item.id === "freeRerollToken") {
@@ -2200,6 +2717,12 @@ function activateUsable(instanceId) {
     // spent once a perk is chosen (applyPerkShield()).
     spent = false;
     renderPerkShieldPicker(instanceId);
+  } else if (item.id === "xMultUpgradeToken") {
+    // Same deal as Perk Reroll/Shield Token above - not consumed here,
+    // opens its own picker instead (see renderXMultUpgradePicker()), only
+    // actually spent once a perk is chosen (applyXMultUpgrade()).
+    spent = false;
+    renderXMultUpgradePicker(instanceId);
   }
 
   if (spent) state.usablesOwned.splice(index, 1);
@@ -2249,7 +2772,7 @@ function renderPerkRerollPicker(usableInstanceId) {
   // beginPerkRerollSpin()), it's only ever this ONE button that needs to
   // react to a spin starting (disabled so backing out mid-reveal isn't
   // possible - see there).
-  state.perksOwned.filter(isSlotOccupyingPerk).forEach((perk) => {
+  perksInSlotOrder(state.perksOwned.filter(isSlotOccupyingPerk)).forEach((perk) => {
     const card = document.createElement("div");
     card.className = "pack-card pack-card-large perk-choice-card" + (perk.tint ? ` tint-${perk.tint}` : "");
     attachCardTilt(card);
@@ -2269,7 +2792,7 @@ function renderPerkRerollPicker(usableInstanceId) {
     if (typeof perk.xMult !== "undefined") {
       const multBadge = document.createElement("div");
       multBadge.className = "perk-card-xmult-badge";
-      multBadge.textContent = `+${resolveXMult(perk, state)}x`;
+      multBadge.textContent = xMultBadgeText(perk, state);
       card.appendChild(multBadge);
     }
     card.addEventListener("click", () => beginPerkRerollSpin(perk, card, name, desc, optWrap, backBtn, p, usableInstanceId));
@@ -2319,7 +2842,7 @@ function renderPerkShieldPicker(usableInstanceId) {
   btnRow.className = "modal-btn-row";
   btnRow.appendChild(backBtn);
 
-  state.perksOwned.filter((perk) => isSlotOccupyingPerk(perk) && !perk.shielded).forEach((perk) => {
+  perksInSlotOrder(state.perksOwned.filter((perk) => isSlotOccupyingPerk(perk) && !perk.shielded)).forEach((perk) => {
     const card = document.createElement("div");
     card.className = "pack-card pack-card-large perk-choice-card" + (perk.tint ? ` tint-${perk.tint}` : "");
     attachCardTilt(card);
@@ -2338,7 +2861,7 @@ function renderPerkShieldPicker(usableInstanceId) {
     if (typeof perk.xMult !== "undefined") {
       const multBadge = document.createElement("div");
       multBadge.className = "perk-card-xmult-badge";
-      multBadge.textContent = `+${resolveXMult(perk, state)}x`;
+      multBadge.textContent = xMultBadgeText(perk, state);
       card.appendChild(multBadge);
     }
     card.addEventListener("click", () => applyPerkShield(perk, usableInstanceId));
@@ -2360,6 +2883,102 @@ function renderPerkShieldPicker(usableInstanceId) {
 function applyPerkShield(perk, usableInstanceId) {
   const index = state.perksOwned.indexOf(perk);
   if (index !== -1) state.perksOwned[index].shielded = true;
+
+  const usableIndex = state.usablesOwned.findIndex((u) => u.instanceId === usableInstanceId);
+  if (usableIndex !== -1) state.usablesOwned.splice(usableIndex, 1);
+
+  hideModal();
+  renderAll();
+  rollBtn.focus();
+  saveState();
+}
+
+const X_MULT_UPGRADE_TOKEN_STEP = 0.75;
+
+// X Mult Perk Upgrade Token's picker - same flat clickable-pack-card-list
+// template as Perk Shield Token's own picker just above, narrowed to owned
+// perks that actually carry an xMult (a plain number or a function - see
+// resolveXMult()/applyXMultUpgrade()) instead of "not already shielded".
+// Every xMult perk qualifies here, including a "fixed" (plain-number, non-
+// growing) one like First Instinct - resolveXMult()'s own xMultUpgradeBonus
+// addition works the same regardless of what kind of xMult the perk
+// started with. usableInstanceId is threaded through to applyXMultUpgrade()
+// below, which is the point this token instance actually gets spent -
+// opening this picker does NOT spend it (see activateUsable()).
+function renderXMultUpgradePicker(usableInstanceId) {
+  modalBox.innerHTML = "";
+  modalBox.classList.add("perk-choice-modal");
+
+  const h2 = document.createElement("h2");
+  h2.textContent = "X Mult Perk Upgrade Token";
+  const p = document.createElement("p");
+  p.textContent = `Choose one owned perk to permanently add +${X_MULT_UPGRADE_TOKEN_STEP}x to:`;
+
+  const optWrap = document.createElement("div");
+  optWrap.className = "perk-options perk-choice-options";
+
+  // "Back" (not "Cancel") - same reasoning as Perk Reroll/Shield Token's
+  // own Back button: leaving this way returns to the Usables panel with
+  // the token still owned and unspent.
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "modal-btn";
+  backBtn.textContent = "Back";
+  backBtn.addEventListener("click", () => {
+    hideModal();
+    renderAll();
+    rollBtn.focus();
+  });
+  const btnRow = document.createElement("div");
+  btnRow.className = "modal-btn-row";
+  btnRow.appendChild(backBtn);
+
+  perksInSlotOrder(state.perksOwned.filter((perk) => isSlotOccupyingPerk(perk) && typeof perk.xMult !== "undefined")).forEach((perk) => {
+    const card = document.createElement("div");
+    card.className = "pack-card pack-card-large perk-choice-card" + (perk.tint ? ` tint-${perk.tint}` : "");
+    attachCardTilt(card);
+    if (perk.shiny) decorateShiny(card);
+    if (perk.shielded) decorateShielded(card);
+
+    const name = document.createElement("div");
+    name.className = "pack-card-name";
+    name.textContent = perk.name;
+
+    const desc = document.createElement("div");
+    desc.className = "pack-card-rule-desc";
+    desc.textContent = perk.desc;
+
+    card.appendChild(name);
+    card.appendChild(desc);
+    const multBadge = document.createElement("div");
+    multBadge.className = "perk-card-xmult-badge";
+    multBadge.textContent = xMultBadgeText(perk, state);
+    card.appendChild(multBadge);
+    card.addEventListener("click", () => applyXMultUpgrade(perk, usableInstanceId));
+    optWrap.appendChild(card);
+  });
+
+  modalBox.appendChild(h2);
+  modalBox.appendChild(p);
+  modalBox.appendChild(optWrap);
+  modalBox.appendChild(btnRow);
+  modalOverlay.classList.remove("hidden");
+  modalBox.focus();
+}
+
+// Adds X_MULT_UPGRADE_TOKEN_STEP to the chosen perk instance's own
+// xMultUpgradeBonus (resolveXMult() adds it on top of whatever the perk's
+// real xMult resolves to, number or function alike - see there) and spends
+// the token. Looked up by object identity (state.perksOwned.indexOf(perk)),
+// same reasoning as applyPerkShield()/applyPerkReroll(): the array can
+// shift under a stale index while the picker is open (e.g. a mid-run save/
+// reload elsewhere).
+function applyXMultUpgrade(perk, usableInstanceId) {
+  const index = state.perksOwned.indexOf(perk);
+  if (index !== -1) {
+    const p = state.perksOwned[index];
+    p.xMultUpgradeBonus = Math.round(((p.xMultUpgradeBonus || 0) + X_MULT_UPGRADE_TOKEN_STEP) * 100) / 100;
+  }
 
   const usableIndex = state.usablesOwned.findIndex((u) => u.instanceId === usableInstanceId);
   if (usableIndex !== -1) state.usablesOwned.splice(usableIndex, 1);
@@ -2426,7 +3045,7 @@ function beginPerkRerollSpin(perk, card, nameEl, descEl, optWrap, backBtn, instr
     if (typeof def.xMult !== "undefined") {
       multBadge = document.createElement("div");
       multBadge.className = "perk-card-xmult-badge";
-      multBadge.textContent = `+${resolveXMult(def, state)}x`;
+      multBadge.textContent = xMultBadgeText(def, state);
       card.appendChild(multBadge);
     }
   };
@@ -2531,6 +3150,7 @@ function turnkeyBlockedCategoryKeys() {
 function categoryIsBlocked(key) {
   return state.blockedCategoryKeys.includes(key)
     || state.cullerBlockedCategoryKeys.includes(key)
+    || state.blessingCullerBlockedCategoryKeys.includes(key)
     || state.gatekeeperBlockedCategoryKeys.includes(key)
     || turnkeyBlockedCategoryKeys().includes(key);
 }
@@ -2565,6 +3185,32 @@ function refreshGatekeeperBlocks() {
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
   state.gatekeeperBlockedCategoryKeys = shuffled.slice(0, GATEKEEPER_BLOCK_COUNT).map((cat) => cat.key);
+}
+
+// Blessing of The Gatekeeper: same re-roll timing/eligibility/stop-turns
+// rule as refreshGatekeeperBlocks() above, reversed into a +2x boost
+// instead of a block - independent of which boss actually rolled (see
+// hasBlessing()), so it can pick from (and coexist with) whatever the real
+// Gatekeeper already blocked this turn.
+function refreshBlessingGatekeeperBoosts() {
+  if (state.phase !== "main" || !hasBlessing("blessing_theGatekeeper")) {
+    state.blessingGatekeeperBoostedCategoryKeys = [];
+    return;
+  }
+  const turnsRemainingIncludingThis = turnLimit() - state.turn + 1;
+  if (turnsRemainingIncludingThis <= GATEKEEPER_STOP_TURNS_REMAINING) {
+    state.blessingGatekeeperBoostedCategoryKeys = [];
+    return;
+  }
+  const eligible = activeCategories().filter(
+    (cat) => state.scorecard[cat.key] == null && !categoryIsBlocked(cat.key)
+  );
+  const shuffled = [...eligible];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  state.blessingGatekeeperBoostedCategoryKeys = shuffled.slice(0, BLESSING_GATEKEEPER_BOOST_COUNT).map((cat) => cat.key);
 }
 
 // The Culler: a one-time effect fired the instant a level with this boss
@@ -2603,6 +3249,35 @@ function applyCullerEffect() {
   });
 }
 
+// Blessing of The Culler: same one-time-at-level-start shape as
+// applyCullerEffect() above, reversed into removing the 2 LEAST-boosted
+// eligible categories instead of the most - independent of which boss
+// actually rolled (see hasBlessing()). Kept in its own
+// blessingCullerBlockedCategoryKeys/blessingCullerBoostedCategoryKeys pair
+// (see newRunState()) so it can never clobber the real Culler's own state
+// if both happen to be live in the same level.
+function applyBlessingCullerEffect() {
+  if (state.phase !== "main" || !hasBlessing("blessing_theCuller")) return;
+  const active = activeCategories();
+  const eligible = active.filter(
+    (cat) => state.scorecard[cat.key] == null && !categoryIsBlocked(cat.key)
+  );
+  const shuffled = [...eligible];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  shuffled.sort((a, b) => (state.categoryBonus[a.key] || 0) - (state.categoryBonus[b.key] || 0));
+  const removedKeys = shuffled.slice(0, BLESSING_CULLER_REMOVE_COUNT).map((cat) => cat.key);
+  removedKeys.forEach((key) => {
+    if (!state.blessingCullerBlockedCategoryKeys.includes(key)) state.blessingCullerBlockedCategoryKeys.push(key);
+  });
+  active.forEach((cat) => {
+    if (removedKeys.includes(cat.key)) return;
+    if (!state.blessingCullerBoostedCategoryKeys.includes(cat.key)) state.blessingCullerBoostedCategoryKeys.push(cat.key);
+  });
+}
+
 // The Landlord: charges flat rent the instant each turn begins - turn 1 in
 // startNextLevel(), turn N+1 in commitScore()'s own turn-advance block -
 // same two call sites every other per-turn boss hook uses (see
@@ -2612,8 +3287,12 @@ function applyCullerEffect() {
 // player can cover it, so state.money is allowed to go negative here.
 const LANDLORD_RENT_PER_TURN = 2;
 function chargeLandlordRent() {
-  if (activeBossModifier()?.id !== "theLandlord") return;
-  state.money -= LANDLORD_RENT_PER_TURN;
+  if (activeBossModifier()?.id === "theLandlord") state.money -= LANDLORD_RENT_PER_TURN;
+  // Blessing of The Landlord: same instant-every-turn timing, reversed into
+  // a flat gain - independent of which boss actually rolled (see
+  // hasBlessing()), so it can stack with the real Landlord's own rent above
+  // in the same turn.
+  if (state.phase === "main" && hasBlessing("blessing_theLandlord")) state.money += BLESSING_LANDLORD_GAIN_PER_TURN;
 }
 
 // ---------- Game state ----------
@@ -2744,6 +3423,30 @@ function newRunState(diceCount) {
     // "filled" branch of addCatRow() in renderScorecard(). NOT reset per
     // turn, same lifecycle as cullerBlockedCategoryKeys above.
     cullerBoostedCategoryKeys: [],
+    // Every Blessing (see BLESSING_POOL) currently active for this round -
+    // instances move here from state.usablesOwned the moment they're
+    // activated (see activateUsable()), never carried in startNextLevel()'s
+    // `carry` object on purpose, so the whole array is wiped the instant the
+    // round ends - that's the entire mechanism behind a Blessing only
+    // lasting one round, no separate expiry bookkeeping needed. Every
+    // Blessing effect reads through hasBlessing() rather than this
+    // directly. The Edict is the one Blessing that never appears here at
+    // all (see activateUsable()'s own comment).
+    activeBlessings: [],
+    // Blessing of The Gatekeeper's own feature (see
+    // refreshBlessingGatekeeperBoosts()) - which up-to-3 unfilled categories
+    // grant +2x this turn. Same reset lifecycle as gatekeeperBlockedCategoryKeys
+    // above (every turn, including turn 1).
+    blessingGatekeeperBoostedCategoryKeys: [],
+    // Blessing of The Culler's own feature (see applyBlessingCullerEffect()) -
+    // its 2 permanently-removed (least-boosted) categories and every other
+    // category's +0.2x boost for the rest of this round. Kept separate from
+    // the real Culler's own cullerBlockedCategoryKeys/cullerBoostedCategoryKeys
+    // so the two effects (boss and blessing) can never clobber each other if
+    // both are live at once. Same reset lifecycle as those (NOT reset per
+    // turn, only by the next startNextLevel() rebuild).
+    blessingCullerBlockedCategoryKeys: [],
+    blessingCullerBoostedCategoryKeys: [],
     baseRerolls: 2, // + 1 initial throw = 3 total throws by default
     bonusRerolls: 0,
     wildIndices: [],
@@ -2765,10 +3468,18 @@ function newRunState(diceCount) {
     categoryBonus: {},
     // The 3 categories/rule ids currently offered by an opened, not-yet-
     // resolved pack (null when no pack is open) - pendingPackKind says
-    // which ("category" or "rule") pendingPackOffer's entries are. Reset
-    // each small-game completion, never carried to the next phase.
+    // which ("category", "rule", "perk", or "blessing") pendingPackOffer's
+    // entries are. Reset each small-game completion, never carried to the
+    // next phase.
     pendingPackOffer: null,
     pendingPackKind: null,
+    // Which usablesOwned instance opened the current Blessing offer (see
+    // activateUsable()'s "blessing" branch) - null unless pendingPackKind is
+    // "blessing". That instance is deliberately left owned/unspent until the
+    // offer actually resolves (pick or skip - see resolveBlessingOffer()),
+    // unlike every other pack kind, which already has its cost paid and slot
+    // cleared by the time its offer opens.
+    pendingBlessingInstanceId: null,
     // Which of pendingPackOffer's category keys (if any) rolled Boosted -
     // reset whenever a new pack is opened or the offer is resolved/skipped.
     pendingPackBoostedKeys: [],
@@ -2807,6 +3518,17 @@ function newRunState(diceCount) {
     freeRerollActive: false,
     thirdTimesCharmPendingBossLock: false,
     thirdTimesCharmLocksRemaining: 0,
+    // Fire Sale bookkeeping: the same "arm on trigger, drain over the next
+    // 2 small-game shops" shape as Third Time's the Charm's own pair just
+    // above, except the trigger is Fire Sale's own coverage running out
+    // (see tickFireSale()) rather than crossing a reroll-count threshold.
+    // Tracked as its own independent pair (not folded into Third Time's
+    // the Charm's fields) so the two can each be mid-cycle at once without
+    // fighting over the same counter - shopPurchasesLocked itself is just
+    // true whenever EITHER one still has charges left (see
+    // showNextRoundPrompt()).
+    fireSalePendingBossLock: false,
+    fireSaleLocksRemaining: 0,
     shopPurchasesLocked: false,
     // Lucky Skip's permanently-banked bonus (see LUCKY_SKIP_BONUS_PER_STACK)
     // added on top of SHINY_PERK_CHANCE / CATEGORY_CARD_BOOST_CHANCE - grows
@@ -2959,6 +3681,7 @@ const rollBtn = document.getElementById("rollBtn");
 const restartBtn = document.getElementById("restartBtn");
 const debugMoneyBtn = document.getElementById("debugMoneyBtn");
 const particlesToggleBtn = document.getElementById("particlesToggleBtn");
+const debugBlessingBtn = document.getElementById("debugBlessingBtn");
 const rollsLeftEl = document.getElementById("rollsLeft");
 const mulliganBtn = document.getElementById("mulliganBtn");
 const scoreBody = document.getElementById("scoreBody");
@@ -3264,6 +3987,30 @@ function buildCoinMarkEl(count) {
   return { wrap, icon, countEl };
 }
 
+// Brief golden flash the instant a Coin Die actually pays out (see
+// finishCommitScore()) - a standalone overlay positioned via
+// getBoundingClientRect() at the moment of the trigger, same technique
+// triggerMoneySparkBurst()/spawnHandBannerBeam() already use elsewhere,
+// rather than animating the real .die-coin-mark element in place: a
+// normal turn advance resets state.dice and rebuilds the whole tray via
+// renderAll() synchronously, right after this runs, which would tear the
+// real mark (and any animation riding on it) out of the DOM before a
+// single frame ever painted it. A standalone element appended to <body>
+// has no such dependency on the tray surviving.
+function flashCoinDiePayout(dieIndex) {
+  const scene = diceTray.children[dieIndex];
+  const mark = scene && scene.querySelector(".die-coin-mark");
+  if (!mark) return;
+  const rect = mark.getBoundingClientRect();
+  const flash = document.createElement("div");
+  flash.className = "coin-die-payout-flash";
+  flash.textContent = "$";
+  flash.style.left = `${rect.left + rect.width / 2}px`;
+  flash.style.top = `${rect.top + rect.height / 2}px`;
+  flash.addEventListener("animationend", () => flash.remove(), { once: true });
+  document.body.appendChild(flash);
+}
+
 function createDieFace(position, value, coinCount) {
   const face = document.createElement("div");
   face.className = "die-face " + position;
@@ -3322,6 +4069,17 @@ function renderDie(index) {
   // ever one instance (doesn't stack), so no count/stack handling needed.
   if (state.perksOwned.some((p) => p.id === "luckyDie" && p.dieIndex === index)) {
     scene.classList.add("lucky-die-marked");
+    // The face's shimmer (.lucky-die-marked .die-face::before, see
+    // style.css) is a CSS animation on a brand-new element every render -
+    // renderDice() rebuilds every die from scratch even when only one of
+    // them was actually toggled (held/unheld), so without this, simply
+    // locking ANY die reset the shimmer back to its own start every time,
+    // however far through its 4s loop it actually was. A negative delay
+    // derived straight from the wall clock (not a per-mark timestamp, which
+    // would need its own reset bookkeeping) keeps it reading as one
+    // continuous, unbroken loop across any number of re-renders -
+    // indistinguishable from an animation that was never interrupted.
+    scene.style.setProperty("--lucky-shimmer-delay", `-${performance.now() % 4000}ms`);
   }
   scene.dataset.index = index;
 
@@ -3373,14 +4131,21 @@ function renderDie(index) {
   // Die above, not per-face like Coin Die - shown as one combined badge for
   // every instance marking this die (they always grow in lockstep, sharing
   // the exact same trigger), so a Coin Die-style per-instance stack count
-  // isn't needed here, just the total. Shown even at +0 (freshly picked,
+  // isn't needed here, just the total. Shown even at +0/+1 (freshly picked,
   // never yet grown) so the marked die itself is still discoverable before
   // its first hit.
+  //
+  // Includes the SAME pending +1 growth streakDieBonusFor() already assumes
+  // for the current hand's own score (main game only - see there) - showing
+  // the raw, not-yet-grown p.bonus here instead used to read as "this die
+  // says +9" right before a commit that actually banked +10, an off-by-one
+  // between what the badge promised and what got credited.
   const streakDieInstances = state.perksOwned.filter((p) => p.id === "streakDie" && p.dieIndex === index);
   if (streakDieInstances.length > 0) {
+    const streakGrowthThisHand = state.phase === "main" ? STREAK_DIE_GROWTH_PER_HIT : 0;
     const streakBadge = document.createElement("span");
     streakBadge.className = "die-streak-badge";
-    streakBadge.textContent = `+${streakDieInstances.reduce((sum, p) => sum + p.bonus, 0)}`;
+    streakBadge.textContent = `+${streakDieInstances.reduce((sum, p) => sum + p.bonus + streakGrowthThisHand, 0)}`;
     scene.appendChild(streakBadge);
   }
   scene.addEventListener("click", () => toggleHold(index));
@@ -3401,7 +4166,18 @@ function totalThrowsAllowed() {
   // than being a flat, permanent -1 every single hand. Floored at 1 so the
   // player is never left with literally nothing to throw.
   const undertakerReduction = activeBossModifier()?.id === "theUndertaker" && state.turn % 2 === 0 ? 1 : 0;
-  return Math.max(1, total - undertakerReduction);
+  // Blessing of The Undertaker: same every-other-turn shape as the real
+  // Undertaker above, reversed into a bonus reroll instead of a taken one -
+  // independent of which boss actually rolled. Parity is measured relative
+  // to each instance's own activatedOnTurn (set in activateUsable()), not
+  // state.turn's raw parity - so the turn it's activated on always counts
+  // as the first "on" turn (kicks in immediately) instead of possibly
+  // landing on an "off" turn and doing nothing until the next one.
+  const undertakerBonus = state.phase === "main"
+    ? state.activeBlessings.filter((b) => b.id === "blessing_theUndertaker" && (state.turn - b.activatedOnTurn) % 2 === 0).length
+      * BLESSING_UNDERTAKER_BONUS_REROLLS
+    : 0;
+  return Math.max(1, total - undertakerReduction + undertakerBonus);
 }
 
 function upperSectionSum() {
@@ -3455,6 +4231,125 @@ let highlightedRuleCardIds = new Set();
 // The Culler, both resolved before this ever runs) are captured as the
 // baseline instead of misread as "newly" blocked.
 let previouslyBlockedCategoryKeys = null;
+
+// The only categories whose payout doesn't depend on which faces actually
+// matched, just that the pattern was hit at all (15/20/25 regardless of
+// which run of faces made it) - see categoryScoreTooltipText() below,
+// which shows that one flat number for these, versus the actual dice that
+// make it up for every other category.
+const FIXED_SCORE_CATEGORY_KEYS = ["smallStraight", "largeStraight", "majorStraight"];
+
+// The exact non-wild dice VALUES that count toward `key`, mirroring
+// computeRawScore()'s own switch (same faces, same high-to-low tie-break)
+// but returning the actual matching dice instead of a formula result -
+// unlike usedFacesForCategory() (a plain Set of which FACES are relevant,
+// used by Blue Die/Leftovers, where a count of 1 vs. 3 makes no
+// difference), this cares about exactly how many dice of that face the
+// pattern actually uses - e.g. One Pair with three 6s in hand still only
+// ever uses 2 of them, never all 3.
+function categoryUsedDice(key, dice, wildIndices) {
+  const nonWildDice = dice.filter((_, i) => !wildIndices.includes(i));
+  const c = counts(nonWildDice);
+  switch (key) {
+    case "ones": return Array(c[1]).fill(1);
+    case "twos": return Array(c[2]).fill(2);
+    case "threes": return Array(c[3]).fill(3);
+    case "fours": return Array(c[4]).fill(4);
+    case "fives": return Array(c[5]).fill(5);
+    case "sixes": return Array(c[6]).fill(6);
+    case "onePair": {
+      for (let f = 6; f >= 1; f--) if (c[f] >= 2) return Array(2).fill(f);
+      return [];
+    }
+    case "twoPairs": {
+      const pairFaces = [];
+      for (let f = 6; f >= 1; f--) if (c[f] >= 2) pairFaces.push(f);
+      return pairFaces.length >= 2 ? [...Array(2).fill(pairFaces[0]), ...Array(2).fill(pairFaces[1])] : [];
+    }
+    case "threeKind": {
+      for (let f = 6; f >= 1; f--) if (c[f] >= 3) return Array(3).fill(f);
+      return [];
+    }
+    case "fourKind": {
+      for (let f = 6; f >= 1; f--) if (c[f] >= 4) return Array(4).fill(f);
+      return [];
+    }
+    case "fullHouse": {
+      let best = 0;
+      let bestDice = [];
+      for (let f = 1; f <= 6; f++) {
+        if (c[f] < 3) continue;
+        for (let g = 1; g <= 6; g++) {
+          if (g === f || c[g] < 2) continue;
+          const score = f * 3 + g * 2;
+          if (score > best) { best = score; bestDice = [...Array(3).fill(f), ...Array(2).fill(g)]; }
+        }
+      }
+      return bestDice;
+    }
+    case "yatzy": {
+      for (let f = 1; f <= 6; f++) if (c[f] >= 5) return Array(5).fill(f);
+      return [];
+    }
+    case "sixKind": {
+      for (let f = 1; f <= 6; f++) if (c[f] >= 6) return Array(6).fill(f);
+      return [];
+    }
+    case "sevenKind": {
+      for (let f = 1; f <= 6; f++) if (c[f] >= 7) return Array(7).fill(f);
+      return [];
+    }
+    case "chance":
+      return nonWildDice;
+    case "threePairs": {
+      const pairFaces = [];
+      for (let f = 6; f >= 1; f--) if (c[f] >= 2) pairFaces.push(f);
+      return pairFaces.length >= 3 ? nonWildDice : [];
+    }
+    case "twoThreeKind": {
+      const tripleFaces = [];
+      for (let f = 6; f >= 1; f--) if (c[f] >= 3) tripleFaces.push(f);
+      return tripleFaces.length >= 2 ? nonWildDice : [];
+    }
+    default:
+      return [];
+  }
+}
+
+// The live score preview's own trailing (green) number is baseHit*catMult,
+// scaled - see the "preview - bonusPreview - blueBonusPreview" arithmetic
+// in addCatRow() below, which this mirrors. Building the tooltip text that
+// explains where that number comes from: either the Straights' own flat
+// payout (FIXED_SCORE_CATEGORY_KEYS), or the exact dice that count toward
+// it otherwise (see categoryUsedDice()) - each followed by "x catMult"
+// whenever a card/blessing multiplier is actually in play.
+// Lists EVERY multiplier actually scaling this category's base score, not
+// just the card-boost one (catMult) - Hotline and Lucky Number both apply
+// too (see the preview computation just above addCatRow()'s own baseEl),
+// and folding them into the shown number with no explanation was exactly
+// the "where are these multipliers even coming from" confusion this was
+// reported for. Each non-obvious term gets its own name; catMult doesn't
+// (it's already visible as the category's own multiplier badge).
+function categoryScoreTooltipText(key, dice, wildIndices, catMult, doubled) {
+  let basePart;
+  if (FIXED_SCORE_CATEGORY_KEYS.includes(key)) {
+    basePart = String(bestScoreForCategory(key, dice, wildIndices));
+  } else {
+    const usedDice = categoryUsedDice(key, dice, wildIndices);
+    basePart = usedDice.length > 0 ? usedDice.join(" + ") : "0";
+  }
+  // formatMultiplier()/formatMultiplierPrecise() already append their own
+  // trailing "x" (e.g. "2x") - stripped here since this format uses a
+  // literal " x " between terms instead ("15 x 2 x 1.5 (Hotline)"), not a
+  // second multiplication symbol.
+  const terms = [basePart];
+  if (catMult !== 1) terms.push(formatMultiplier(catMult).replace(/x$/, ""));
+  if (doubled) terms.push(`${formatMultiplier(HOTLINE_MULTIPLIER).replace(/x$/, "")} (Hotline)`);
+  if (state.scoreMultiplier !== 1) {
+    terms.push(`${formatMultiplierPrecise(state.scoreMultiplier).replace(/x$/, "")} (Lucky Number)`);
+  }
+  return terms.join(" x ");
+}
 
 function renderScorecard() {
   const currentBlockedKeys = new Set(activeCategories().filter((cat) => categoryIsBlocked(cat.key)).map((cat) => cat.key));
@@ -3565,6 +4460,14 @@ function renderScorecard() {
         if (!filledAlready && state.cullerBoostedCategoryKeys.includes(cat.key)) {
           moneyTd.classList.add("cat-multiplier-culler");
         }
+        // Blessing of The Gatekeeper: this turn's +2x categories read white
+        // instead of the normal orange/green, same "still open" scoping as
+        // Culler's own muted treatment just above - once committed, the
+        // boost is already baked into the banked score, nothing left to
+        // call out on the badge itself.
+        if (!filledAlready && state.blessingGatekeeperBoostedCategoryKeys.includes(cat.key)) {
+          moneyTd.classList.add("cat-multiplier-gatekeeper-blessing");
+        }
       } else {
         moneyTd.textContent = "-";
       }
@@ -3663,6 +4566,34 @@ function renderScorecard() {
           bankedEl.textContent = `${state.scorecard[cat.key]}+`;
           scoreTd.appendChild(bankedEl);
         }
+        // Blue Die: kept as its own separate blue "+X", to the left of the
+        // purple rule-card one below - never folded into bonusPreview
+        // (breakdown.blueBonus is deliberately excluded from bonusTotal,
+        // see scoreBreakdownForCategory()) or into its tooltip list (see
+        // the .filter() below), so its amount is never counted twice.
+        const blueBonusPreview = raw > 0 ? Math.round(breakdown.blueBonus * flatScaleUp) : 0;
+        if (blueBonusPreview !== 0) {
+          const blueEl = document.createElement("span");
+          blueEl.className = "cat-score-blue-bonus";
+          blueEl.textContent = `+${blueBonusPreview}`;
+          // Hovering reveals which owned Blue Die(s) it's made of and how
+          // much each one's own marked die is currently contributing, same
+          // "name + amount" shape as the purple tooltip below.
+          const usedFaces = usedFacesForCategory(cat.key, state.dice, wildIndices);
+          const contributingBlueDice = state.perksOwned.filter(
+            (p) => p.id === "blueDie" && !wildIndices.includes(p.dieIndex) && usedFaces.has(state.dice[p.dieIndex])
+          );
+          if (contributingBlueDice.length > 0) {
+            const tooltip = document.createElement("div");
+            tooltip.className = "perk-tooltip";
+            tooltip.textContent = contributingBlueDice
+              .map((p) => `Blue Die +${Math.round(state.dice[p.dieIndex] * flatScaleUp)}`)
+              .join(", ");
+            blueEl.appendChild(tooltip);
+            attachClampedTooltip(blueEl, tooltip, scorecardPanel);
+          }
+          scoreTd.appendChild(blueEl);
+        }
         if (bonusPreview !== 0) {
           const bonusEl = document.createElement("span");
           bonusEl.className = "cat-score-bonus";
@@ -3670,8 +4601,9 @@ function renderScorecard() {
           // Hovering the "+X" reveals exactly which rule card(s) it's made
           // of and how much each contributed (scaled the same way the
           // combined total above is), instead of leaving the player to
-          // guess from the number alone.
-          const ruleBreakdown = ruleCardScoreBreakdown(cat.key, state.dice, wildIndices);
+          // guess from the number alone. Blue Die excluded - it gets its
+          // own separate blue "+X" just above instead.
+          const ruleBreakdown = ruleCardScoreBreakdown(cat.key, state.dice, wildIndices).filter((r) => r.id !== "blueDie");
           if (ruleBreakdown.length > 0) {
             const tooltip = document.createElement("div");
             tooltip.className = "perk-tooltip";
@@ -3686,9 +4618,31 @@ function renderScorecard() {
           }
           scoreTd.appendChild(bonusEl);
         }
-        scoreTd.appendChild(document.createTextNode(String(preview - bonusPreview)));
+        const baseEl = document.createElement("span");
+        baseEl.className = "cat-score-base";
+        baseEl.textContent = String(preview - bonusPreview - blueBonusPreview);
+        // Hovering reveals what that number is actually made of - either
+        // the dice that sum to it, or the category's own fixed payout for
+        // the matched pattern - times the category multiplier, whenever
+        // one's actually in play (see categoryScoreTooltipText()).
+        const baseTooltip = document.createElement("div");
+        baseTooltip.className = "perk-tooltip";
+        baseTooltip.textContent = categoryScoreTooltipText(cat.key, state.dice, wildIndices, breakdown.catMult, doubled);
+        baseEl.appendChild(baseTooltip);
+        attachClampedTooltip(baseEl, baseTooltip, scorecardPanel);
+        scoreTd.appendChild(baseEl);
         if (luckyActive) scoreTd.classList.add("lucky-glow");
         tr.addEventListener("click", () => commitScore(cat.key));
+        // Uppercut/Straight Shot's own X-mult only actually applies to
+        // certain categories - hovering/keyboard-focusing this row lets
+        // the header total (see computeActiveXMultTotal()) AND the card's
+        // own badge (see updatePerkXMultCardsDisplay()) show the real
+        // combined multiplier committing THIS category would get, instead
+        // of always assuming it applies.
+        tr.addEventListener("mouseenter", () => { hoveredCategoryKey = cat.key; updatePerkXMultTotalDisplay(); updatePerkXMultCardsDisplay(); });
+        tr.addEventListener("mouseleave", () => { if (hoveredCategoryKey === cat.key) { hoveredCategoryKey = null; updatePerkXMultTotalDisplay(); updatePerkXMultCardsDisplay(); } });
+        tr.addEventListener("focus", () => { hoveredCategoryKey = cat.key; updatePerkXMultTotalDisplay(); updatePerkXMultCardsDisplay(); });
+        tr.addEventListener("blur", () => { if (hoveredCategoryKey === cat.key) { hoveredCategoryKey = null; updatePerkXMultTotalDisplay(); updatePerkXMultCardsDisplay(); } });
       } else {
         tr.classList.add("disabled");
         scoreTd.textContent = "-";
@@ -3747,6 +4701,27 @@ function renderScorecard() {
   // coupling this here means every call site gets it for free.
   renderRuleInventory();
   renderUsableInventory();
+
+  // Every row above was just rebuilt from scratch, so whatever the mouse/
+  // keyboard focus was sitting on a moment ago is gone - a stale
+  // hoveredCategoryKey would otherwise linger past a rebuild (e.g. between
+  // throws, a category's own selectable/blocked state can change without
+  // the mouse ever moving). Re-derive it fresh from the real DOM: whichever
+  // fresh row is actually still under the pointer (:hover survives a
+  // same-position rebuild in every browser that matters here) or holds
+  // keyboard focus, if any. The header total (see renderPerks(), which
+  // hasn't necessarily run again this cycle) needs its own explicit
+  // refresh here too, not just a fresh value ready for its NEXT render.
+  const stillHoveredRow = [...scoreBody.querySelectorAll("tr[data-category-key]")].find((tr) => tr.matches(":hover"));
+  hoveredCategoryKey = stillHoveredRow
+    ? stillHoveredRow.dataset.categoryKey
+    : (document.activeElement?.dataset?.categoryKey ?? null);
+  updatePerkXMultTotalDisplay();
+  // Same reasoning as the header total just above - renderPerks() hasn't
+  // necessarily run again this cycle either, so a category-dependent
+  // card's own badge (Uppercut/Straight Shot) needs this same explicit
+  // nudge to reflect the freshly re-derived hoveredCategoryKey too.
+  updatePerkXMultCardsDisplay();
 }
 
 // Sibling panel to renderRuleInventory(), just below it (see
@@ -3758,14 +4733,16 @@ function renderScorecard() {
 // can't be used yet (the tooltip still explains the "why").
 function renderUsableInventory() {
   usableInventory.innerHTML = "";
-  if (state.usablesOwned.length === 0) {
+  if (state.usablesOwned.length === 0 && state.activeBlessings.length === 0) {
     usableInventory.classList.add("hidden");
     return;
   }
   usableInventory.classList.remove("hidden");
 
   state.usablesOwned.forEach((instance) => {
-    const usable = USABLE_POOL.find((u) => u.id === instance.id);
+    // Blessing cards (see BLESSING_POOL) live in usablesOwned same as any
+    // other usable, just resolved from their own pool instead.
+    const usable = USABLE_POOL.find((u) => u.id === instance.id) || BLESSING_POOL.find((b) => b.id === instance.id);
     if (!usable) return;
     const activatable = usableActivatable(instance);
 
@@ -3792,6 +4769,37 @@ function renderUsableInventory() {
 
     usableInventory.appendChild(item);
   });
+
+  // Blessings currently active for the round (see activateUsable()'s
+  // "blessing_" branch and state.activeBlessings) - already spent/removed
+  // from usablesOwned above, listed again here as a glowing, non-clickable
+  // pill so the player can still see what's live, same panel a Blessing
+  // sat in before it was activated. The Edict never appears here (see
+  // BLESSING_POOL's own comment) - its effect already fully resolved into
+  // a real, separate, permanent perk the instant it was picked.
+  state.activeBlessings.forEach((instance) => {
+    const blessing = BLESSING_POOL.find((b) => b.id === instance.id);
+    if (!blessing) return;
+
+    const item = document.createElement("div");
+    item.className = "rule-inventory-item usable-item usable-item-blessing-active";
+    item.textContent = blessing.name;
+
+    const tooltip = document.createElement("div");
+    tooltip.className = "perk-tooltip";
+    const tooltipTitle = document.createElement("div");
+    tooltipTitle.className = "perk-tooltip-title";
+    tooltipTitle.textContent = blessing.name;
+    tooltip.appendChild(tooltipTitle);
+    const activeDesc = instance.id === "blessing_theVoid" && instance.favoredFace != null
+      ? `${blessing.desc} Favored face: ${instance.favoredFace}.`
+      : blessing.desc;
+    tooltip.appendChild(document.createTextNode(`${activeDesc} Active for the rest of this round.`));
+    item.appendChild(tooltip);
+    attachFixedTooltip(item, tooltip);
+
+    usableInventory.appendChild(item);
+  });
 }
 
 const PERK_SLOT_COUNT = 4;
@@ -3803,9 +4811,16 @@ const PERK_DELETE_REFUND_SHINY = 20;
 // (how many perk slots are empty right now) instead of a value stored on
 // the instance - so xMult may also be a function(state). Both commitScore()
 // and renderPerks()'s cue text resolve through this one helper so neither
-// has to know which kind a given perk uses.
+// has to know which kind a given perk uses. xMultUpgradeBonus (see
+// applyXMultUpgrade()/X Mult Perk Upgrade Token) is added on top here too,
+// after resolving whichever kind of base xMult the perk has - one insertion
+// point covers every display/scoring call site automatically, and works
+// identically whether the perk's own xMult is a fixed number or a live
+// function.
 function resolveXMult(perk, state) {
-  return typeof perk.xMult === "function" ? perk.xMult(state) : perk.xMult;
+  const base = typeof perk.xMult === "function" ? perk.xMult(state) : perk.xMult;
+  if (typeof base === "undefined") return base;
+  return Math.round((base + (perk.xMultUpgradeBonus || 0)) * 100) / 100;
 }
 
 // A trailing "(+Nx)" for an owned X-mult perk instance's OWN current
@@ -3816,7 +4831,15 @@ function resolveXMult(perk, state) {
 // identical duplicates, e.g. the perk-slots-full replace picker. Perks with
 // no xMult at all get no tag.
 function perkXMultTag(perk) {
-  return typeof perk.xMult !== "undefined" ? ` (+${resolveXMult(perk, state)}x)` : "";
+  if (typeof perk.xMult === "undefined") return "";
+  return state.phase !== "main" ? " (-x)" : ` (+${resolveXMult(perk, state)}x)`;
+}
+
+// The red X-mult badge's own text, shared by every place it's shown on an
+// UNGATED (always-the-real-value) card - reroll/shield/upgrade pickers, The
+// Edict, Blessing of The Edict, and the perk-slots-full replace step.
+function xMultBadgeText(perk, state) {
+  return `+${resolveXMult(perk, state)}x`;
 }
 
 // Whether an xMult perk's badge (see renderPerks()) should show its real
@@ -3831,6 +4854,77 @@ function xMultBadgeIsActive(perk, state) {
   if (!perk.xMultCondition) return true;
   if (perk.xMultCondition.length >= 2) return true;
   return !!perk.xMultCondition(state);
+}
+
+// Which scorecard category (if any) the player currently has "in focus" -
+// the mouse hovering a selectable row, or keyboard focus on one via
+// navigateScorecard()'s arrow-key handling. Re-derived fresh from the real
+// DOM at the end of every renderScorecard() (see there), and also kept
+// live in between full renders by each row's own mouseenter/mouseleave/
+// focus/blur listeners (see addCatRow()) - either path calls
+// updatePerkXMultTotalDisplay() so the two never actually disagree for
+// long. Read by xMultIsActiveForDisplay() below to give a
+// category-dependent card (Uppercut/Straight Shot) a real yes/no instead
+// of xMultBadgeIsActive()'s own "can't know, assume active" default.
+let hoveredCategoryKey = null;
+
+// Same idea as xMultBadgeIsActive() above, but for the header's combined
+// total (see renderPerks()) rather than one card's own badge - a
+// category-dependent condition gets checked for real against
+// hoveredCategoryKey when one is actually in focus, instead of always
+// reading as active.
+function xMultIsActiveForDisplay(perk, state, categoryKey) {
+  if (!perk.xMultCondition) return true;
+  if (perk.xMultCondition.length >= 2) {
+    if (categoryKey != null) return !!perk.xMultCondition(state, categoryKey);
+    return true;
+  }
+  return !!perk.xMultCondition(state);
+}
+
+// The actual combined multiplier a hand committed into `categoryKey` (or,
+// with none focused, whichever categories would show as active per
+// xMultBadgeIsActive()'s own default) would get right now - 1x baseline
+// plus every owned X-mult perk currently active, main-game only (matches
+// the per-card hover glow's own scope).
+function computeActiveXMultTotal(categoryKey) {
+  const activeXMultSum = state.perksOwned
+    .filter((p) => typeof p.xMult !== "undefined" && state.phase === "main" && xMultIsActiveForDisplay(p, state, categoryKey))
+    .reduce((sum, p) => sum + resolveXMult(p, state), 0);
+  return 1 + activeXMultSum;
+}
+
+// Lightweight refresh for the header total alone - used by the scorecard
+// row hover/focus listeners so moving the mouse across rows doesn't have
+// to rebuild the whole perk-card row (renderPerks()) just to update one
+// number. A no-op if the perk row hasn't been drawn at all yet (e.g. still
+// on the very first render).
+function updatePerkXMultTotalDisplay() {
+  const totalEl = document.querySelector(".perk-xmult-total");
+  if (totalEl) totalEl.textContent = formatMultiplierPrecise(computeActiveXMultTotal(hoveredCategoryKey));
+}
+
+// Same idea as updatePerkXMultTotalDisplay() just above, but for each owned
+// perk's OWN card (badge text + the "live" hover glow) instead of the
+// header total - called alongside it from the exact same scorecard row
+// hover/focus listeners, so a category-dependent card (Uppercut/Straight
+// Shot) actually reacts to hovering or arrow-keying onto its own category,
+// not just the header total. Looks each rendered card up via
+// cardToPerkInstance (a WeakMap, so this has to walk the real DOM nodes
+// rather than iterate it directly) - a no-op for every OTHER owned perk,
+// since xMultIsActiveForDisplay() only ever reads hoveredCategoryKey for a
+// 2-arg xMultCondition in the first place. Main-game only, matching
+// xMultIsActiveForDisplay()'s/computeActiveXMultTotal()'s own scope.
+function updatePerkXMultCardsDisplay() {
+  if (state.phase !== "main") return;
+  perkSlots.querySelectorAll(".perk-card").forEach((card) => {
+    const perk = cardToPerkInstance.get(card);
+    if (!perk || typeof perk.xMult === "undefined") return;
+    const isActive = xMultIsActiveForDisplay(perk, state, hoveredCategoryKey);
+    card.classList.toggle("perk-card-xmult-cue", isActive);
+    const badge = card.querySelector(".perk-card-xmult-badge");
+    if (badge) badge.textContent = `+${isActive ? resolveXMult(perk, state) : 0}x`;
+  });
 }
 
 // Identity + origin slot of the perk currently being drag-reordered/deleted
@@ -3848,35 +4942,65 @@ let draggedFromSlot = null;
 // so the cue actually has time to be seen.
 let perkTrashCueActive = false;
 
-// Extra Perk raises this without occupying a slot itself (see renderPerks).
-// Extra Perk raises this without occupying a slot itself. Shiny perks (see
-// SHINY_PERK_CHANCE) DO occupy their own real, visible slot - but it's an
-// extra one layered on top of the normal cap, so owning one never
-// contributes to "perk slots full" (isSlotOccupyingPerk still counts them
-// in visibleCount, and this grows capacity by the exact same amount, so the
-// two increases cancel out in every fullness check).
+// The NORMAL perk slot cap - 4 to start (PERK_SLOT_COUNT), the only way to
+// raise it is an owned Extra Perk copy. A true Shiny perk (see
+// isSeparateShinySlot()) lives entirely OUTSIDE this system: it neither
+// raises nor counts against this cap at all - it brings its own slot,
+// always exactly sized to match how many Shiny perks are owned (1 Shiny =
+// 1 shiny slot, always, so there's never a separate "shiny capacity" to
+// track). Everything this function returns is compared against
+// isNormalSlotPerk()'s own count, never isSlotOccupyingPerk()'s broader one.
 function effectivePerkSlotCount() {
   const extraPerkCopies = state.perksOwned.filter((p) => p.id === "extraPerkSlot").length;
-  const shinyCopies = state.perksOwned.filter((p) => p.shiny && isSlotOccupyingPerk(p)).length;
-  return PERK_SLOT_COUNT + extraPerkCopies + shinyCopies;
+  // Blessing of The Censor's duplicate (see duplicateEligiblePerkForBlessingCensor())
+  // still gets its own "brings its own extra slot" treatment even if it
+  // happens to also be a Shiny perk's own duplicate (shiny: true carries
+  // over with the rest of the spread) - it has to appear the instant it's
+  // created regardless of how full the slots already are (matches the
+  // card's own wording), same as a real Shiny perk's own extra slot used
+  // to work before Shiny moved fully outside this cap.
+  const blessingCensorCopies = state.perksOwned.filter((p) => p.blessingCensorDuplicate).length;
+  // Blessing of The Edict's duplicate (see renderBlessingEdictPicker()) gets
+  // the same "brings its own extra slot" treatment - unlike Censor's copy
+  // this one is permanent (never stripped at a phase transition), so its
+  // slot stays permanently too, for the rest of the run.
+  const blessingEdictCopies = state.perksOwned.filter((p) => p.blessingEdictDuplicate).length;
+  return PERK_SLOT_COUNT + extraPerkCopies + blessingCensorCopies + blessingEdictCopies;
 }
 
 // True for perks that occupy a visible perk-card slot - excludes Extra Perk
 // (raises capacity without occupying a slot itself) and persistent rule-card
 // instances (tracked separately in the rule inventory, never in the perk
-// slots, even though they live in the same perksOwned array).
+// slots, even though they live in the same perksOwned array). Includes
+// Shiny perks - they're still very much a real, visible card, just not one
+// that counts toward the NORMAL cap (see isNormalSlotPerk() below).
 function isSlotOccupyingPerk(p) {
   return p.id !== "extraPerkSlot" && !p.persistent;
 }
 
+// True for a Shiny perk whose slot lives entirely outside the normal cap -
+// excludes a Blessing of The Censor/Edict duplicate that happens to also be
+// Shiny, since THOSE keep bringing their own bonus slot the old way (see
+// effectivePerkSlotCount()'s blessingCensorCopies/blessingEdictCopies) and
+// still count as a normal slot occupant below - only a genuine standalone
+// Shiny perk gets the fully-separate treatment.
+function isSeparateShinySlot(p) {
+  return !!p.shiny && !p.blessingCensorDuplicate && !p.blessingEdictDuplicate;
+}
+
 // True for perks that occupy a slot AND count toward the normal cap -
-// excludes shiny copies too (their slot is an extra one layered on top of
-// the cap, see effectivePerkSlotCount(), so trading one away wouldn't
-// actually make room for anything - never offer them as a "make room"
-// candidate, even though they're still perfectly valid targets for
-// unrelated removal mechanics like Clean Slate/Selective Cut).
+// excludes a true Shiny perk (see isSeparateShinySlot()): its slot is
+// entirely its own, brought and removed alongside the card itself, so
+// trading one away for a normal perk pick would never actually make room
+// for anything - never offer one as a "make room" candidate (see
+// renderPerkOfferModal()/showLevelCompleteModal()'s own replace pickers).
+// It's still a perfectly valid target for unrelated removal mechanics that
+// don't care about slot capacity, like the trash can - just never Clean
+// Slate/Selective Cut/Ooo Shiny either, per DESTRUCTIVE_RULE_IDS's own
+// comment (a separate exclusion, checked directly with `!p.shiny` there,
+// not through this function).
 function isNormalSlotPerk(p) {
-  return isSlotOccupyingPerk(p) && !p.shiny;
+  return isSlotOccupyingPerk(p) && !isSeparateShinySlot(p);
 }
 
 // Maps each rendered perk card element to the perk instance it shows, so a
@@ -3887,11 +5011,16 @@ const cardToPerkInstance = new WeakMap();
 // Backfills instanceId on any perk that doesn't have one yet (freshly
 // picked, or loaded from a save predating this field), then reconciles
 // state.perkSlotOrder against state.perksOwned: drops entries for perks
-// that no longer exist, grows/shrinks to match effectivePerkSlotCount()
-// (shrinking only ever removes trailing *empty* slots, never one that's
-// occupied), and places any not-yet-slotted perk into the first empty slot.
-// Perks intentionally are NOT auto-compacted otherwise, so a card dropped
-// into slot 3 while slot 1 is empty just stays there.
+// that no longer exist, grows/shrinks to match capacity (shrinking only
+// ever removes trailing *empty* slots, never one that's occupied), and
+// places any not-yet-slotted perk into the first empty slot. Perks
+// intentionally are NOT auto-compacted otherwise, so a card dropped into
+// slot 3 while slot 1 is empty just stays there. Capacity here is
+// effectivePerkSlotCount() (the normal 4+Extra Perk cap, Shiny-free) PLUS
+// exactly one slot per owned true Shiny perk (see isSeparateShinySlot()) -
+// a Shiny's own slot is always created and removed in lockstep with the
+// card itself, never independently empty, so it needs no capacity
+// bookkeeping of its own beyond "however many Shiny perks exist right now".
 function syncPerkSlotOrder() {
   state.perksOwned.forEach((p) => {
     if (p.instanceId == null) p.instanceId = state.nextPerkInstanceId++;
@@ -3903,7 +5032,8 @@ function syncPerkSlotOrder() {
   if (!Array.isArray(state.perkSlotOrder)) state.perkSlotOrder = [];
   state.perkSlotOrder = state.perkSlotOrder.map((id) => (id != null && validIds.has(id) ? id : null));
 
-  const capacity = effectivePerkSlotCount();
+  const shinySlotCount = visible.filter(isSeparateShinySlot).length;
+  const capacity = effectivePerkSlotCount() + shinySlotCount;
   while (state.perkSlotOrder.length < capacity) state.perkSlotOrder.push(null);
   while (state.perkSlotOrder.length > capacity && state.perkSlotOrder[state.perkSlotOrder.length - 1] == null) {
     state.perkSlotOrder.pop();
@@ -3916,6 +5046,43 @@ function syncPerkSlotOrder() {
     if (emptyIndex !== -1) state.perkSlotOrder[emptyIndex] = perk.instanceId;
     else state.perkSlotOrder.push(perk.instanceId);
     placedIds.add(perk.instanceId);
+  });
+}
+
+// instanceId -> its current slot index, per the real perk-slot row
+// (state.perkSlotOrder) - the shared lookup behind perksInSlotOrder()
+// below and anywhere else that needs to sort by slot position without
+// losing track of something else tied to each perk (e.g. the replace-a-
+// perk picker in showPackOfferModal(), which has to keep each option's
+// real state.perksOwned array index alongside it for its own click
+// handler). syncPerkSlotOrder() first in case this runs before any render
+// has had a chance to call it itself.
+function perkSlotPositionMap() {
+  syncPerkSlotOrder();
+  const slotPosition = new Map();
+  state.perkSlotOrder.forEach((instanceId, slotIndex) => {
+    if (instanceId != null) slotPosition.set(instanceId, slotIndex);
+  });
+  return slotPosition;
+}
+
+// Sorts a list of owned perks into the same left-to-right order they
+// currently sit in the real perk-slot row, instead of state.perksOwned's
+// own insertion order - used by every "choose one of your perks" picker
+// (Perk Reroll/Shield/X Mult Upgrade Token, The Edict and its Blessing, the
+// two "perk slots full, replace one" pickers) so a player who's drag-and-
+// drop reorganized their perks sees that same arrangement reflected there
+// too, rather than a seemingly-arbitrary order that ignores it. Perks the
+// caller passed in that somehow aren't in a slot at all (not expected for
+// any current caller, all of which already filter through
+// isSlotOccupyingPerk) sort after every slotted one, in their original
+// relative order.
+function perksInSlotOrder(perks) {
+  const slotPosition = perkSlotPositionMap();
+  return [...perks].sort((a, b) => {
+    const posA = slotPosition.has(a.instanceId) ? slotPosition.get(a.instanceId) : Infinity;
+    const posB = slotPosition.has(b.instanceId) ? slotPosition.get(b.instanceId) : Infinity;
+    return posA - posB;
   });
 }
 
@@ -4066,24 +5233,30 @@ function renderPerks() {
     }
 
     // X Multiplier perks whose trigger condition holds right now (see
-    // xMultBadgeIsActive()) get a gentle continuous hover - "this is live
-    // this instant", not a one-off flash tied to whichever hand happened to
-    // just be committed. Milestone hovers for the whole of turns 5/10/15,
-    // not just the moment a hand happens to be scored on one of them; an
-    // unconditionally-live perk (Demolisher/Skipper/Minimalist/Streaker)
-    // simply hovers all the time, truthfully reflecting that it's always
-    // contributing. Re-evaluated fresh on every render, so it naturally
-    // turns on/off exactly when the condition itself does (each turn
-    // advance and each throw already triggers a render). Main-game only -
-    // small games commit far more rapidly, so a perk that's always active
-    // there (nearly all of them) would just hover permanently, which reads
-    // as noise rather than a meaningful signal.
-    const xMultIsActive = !!(typeof perk.xMult !== "undefined" && state.phase === "main" && xMultBadgeIsActive(perk, state));
+    // xMultIsActiveForDisplay()) get a gentle continuous hover - "this is
+    // live this instant", not a one-off flash tied to whichever hand
+    // happened to just be committed. Milestone hovers for the whole of
+    // turns 5/10/15, not just the moment a hand happens to be scored on one
+    // of them; an unconditionally-live perk (Demolisher/Skipper/Minimalist/
+    // Streaker) simply hovers all the time, truthfully reflecting that it's
+    // always contributing. A category-dependent card (Uppercut/Straight
+    // Shot) checks against hoveredCategoryKey here too, same as the header
+    // total does - previously always shown as "active" regardless of what
+    // was hovered/focused (no way to know which category the player might
+    // commit into next), which meant Straight Shot's card never actually
+    // reacted to hovering/arrow-keying onto an ACTUAL Straight row. Re-
+    // evaluated fresh on every render, so it naturally turns on/off exactly
+    // when the condition itself does (each turn advance and each throw
+    // already triggers a render). Main-game only - small games commit far
+    // more rapidly, so a perk that's always active there (nearly all of
+    // them) would just hover permanently, which reads as noise rather than
+    // a meaningful signal.
+    const xMultIsActive = !!(typeof perk.xMult !== "undefined" && state.phase === "main" && xMultIsActiveForDisplay(perk, state, hoveredCategoryKey));
     // A "perk" boss (The Censor/The Edict) currently silencing this exact
     // instance - see currentlyBlockedPerkInstanceId()/activePerksOwned().
     const isBossBlocked = perk.instanceId === currentlyBlockedPerkInstanceId();
     const card = document.createElement("div");
-    card.className = "perk-card" + (perk.tint ? ` tint-${perk.tint}` : "") + (xMultIsActive ? " perk-card-xmult-cue" : "") + (isBossBlocked ? " boss-blocked-perk" : "");
+    card.className = "perk-card" + (perk.tint ? ` tint-${perk.tint}` : "") + (xMultIsActive ? " perk-card-xmult-cue" : "") + (isBossBlocked ? " boss-blocked-perk" : "") + (perk.blessingCensorDuplicate ? " blessing-censor-duplicate" : "");
     card.textContent = perk.name;
     card.draggable = true;
     card.dataset.slotIndex = slotIndex;
@@ -4103,13 +5276,15 @@ function renderPerks() {
     // both the plain-number cards (First Instinct, Demolisher, Skipper,
     // Streaker) and Minimalist's live state-computed one identically. A perk
     // whose trigger condition isn't met right now (e.g. Milestone off turns
-    // 5/10/15) shows the neutral +0x baseline instead of its real value, via
-    // xMultBadgeIsActive() - a truthful "nothing happens if you commit this
-    // instant" readout rather than an always-on number that never changes.
+    // 5/10/15, or Straight Shot/Uppercut with no Straight/upper-cat row
+    // hovered or keyboard-focused) shows the neutral +0x baseline instead of
+    // its real value, via xMultIsActiveForDisplay() - a truthful "nothing
+    // happens if you commit this instant" readout rather than an always-on
+    // number that never changes.
     if (typeof perk.xMult !== "undefined") {
       const multBadge = document.createElement("div");
       multBadge.className = "perk-card-xmult-badge";
-      multBadge.textContent = `+${xMultBadgeIsActive(perk, state) ? resolveXMult(perk, state) : 0}x`;
+      multBadge.textContent = `+${xMultIsActiveForDisplay(perk, state, hoveredCategoryKey) ? resolveXMult(perk, state) : 0}x`;
       card.appendChild(multBadge);
     }
 
@@ -4173,6 +5348,55 @@ function renderPerks() {
 
     perkSlots.appendChild(card);
   });
+
+  // A small always-on-top readout above the row - the build's total X Mult
+  // (left, red) and how many perk slots are actually filled (right, gray).
+  // #perkSlots centers its card row (see .perk-slots' own justify-content)
+  // rather than packing it flush against either edge, so a fixed inset
+  // would drift out of line with the actual cards as the count changes -
+  // this instead measures the real first/last slot (card or empty) just
+  // rendered above and matches their exact left/right edges. Both spans
+  // are position: absolute (see style.css) against #perkSlots itself, so
+  // they always sit above its very first row - which is also why
+  // "last slot" here means the last slot sharing that same row (flex-wrap
+  // can spill extra perks onto a 2nd/3rd row, e.g. 5 cards fitting per row
+  // at one width but only 4 at another - the true last slot overall could
+  // be sitting in a later row, at a completely different x position, and
+  // pinning the readout to ITS edge would float it out past wherever row 1
+  // actually ends), never the true last slot overall.
+  const slotEls = [...perkSlots.children];
+  const firstSlotEl = slotEls[0];
+  const firstRowTop = firstSlotEl ? firstSlotEl.getBoundingClientRect().top : null;
+  const firstRowSlotEls = firstRowTop == null ? [] : slotEls.filter((el) => el.getBoundingClientRect().top === firstRowTop);
+  const lastSlotEl = firstRowSlotEls[firstRowSlotEls.length - 1];
+  const perkSlotsRect = perkSlots.getBoundingClientRect();
+
+  // The actual combined multiplier a hand committed right now would get -
+  // see computeActiveXMultTotal(). Uses whichever category (if any) the
+  // player currently has hovered/keyboard-focused on the scorecard
+  // (hoveredCategoryKey), so a category-dependent card (Uppercut/Straight
+  // Shot) reflects the real category in play instead of always reading as
+  // active. Recomputed fresh on every renderPerks() call, which already
+  // re-runs after every throw (any xMultCondition depending on live state -
+  // rerolls used this turn, current turn number - naturally updates the
+  // instant it does); moving the mouse/focus between rows without a full
+  // re-render is handled separately by updatePerkXMultTotalDisplay().
+  const totalEl = document.createElement("span");
+  totalEl.className = "perk-xmult-total";
+  totalEl.textContent = formatMultiplierPrecise(computeActiveXMultTotal(hoveredCategoryKey));
+  if (firstSlotEl) totalEl.style.left = `${firstSlotEl.getBoundingClientRect().left - perkSlotsRect.left}px`;
+  perkSlots.appendChild(totalEl);
+
+  // isNormalSlotPerk, not isSlotOccupyingPerk - a Shiny perk doesn't count
+  // toward this ratio at all (numerator or denominator), see
+  // effectivePerkSlotCount()'s own comment: 4 normal perks + 1 Shiny always
+  // reads "4/4", never "5/5".
+  const visibleCount = state.perksOwned.filter(isNormalSlotPerk).length;
+  const countEl = document.createElement("span");
+  countEl.className = "perk-slot-count";
+  countEl.textContent = `${visibleCount}/${effectivePerkSlotCount()}`;
+  if (lastSlotEl) countEl.style.right = `${perkSlotsRect.right - lastSlotEl.getBoundingClientRect().right}px`;
+  perkSlots.appendChild(countEl);
 }
 
 // Read-only snapshot of the player's current perk row, for embedding at the
@@ -4185,7 +5409,13 @@ function renderPerks() {
 // interactive hover/cursor treatment. Returns null when nothing is owned
 // yet, so callers can skip appending an empty section.
 function buildOwnedPerksSummary() {
-  const owned = state.perksOwned.filter(isSlotOccupyingPerk);
+  // Walks state.perkSlotOrder directly (same source renderPerks() itself
+  // reads, via syncPerkSlotOrder() first) instead of a plain list of owned
+  // perks with every empty slot tacked on at the end - a slot left empty
+  // in the MIDDLE of the real row (not just a trailing one) needs to show
+  // up in that same middle position here too, not get pushed to the back.
+  syncPerkSlotOrder();
+  const byInstanceId = new Map(state.perksOwned.map((p) => [p.instanceId, p]));
 
   const wrap = document.createElement("div");
   wrap.className = "owned-perks-summary";
@@ -4197,9 +5427,16 @@ function buildOwnedPerksSummary() {
 
   const row = document.createElement("div");
   row.className = "perk-slots owned-perks-summary-row";
-  owned.forEach((perk) => {
+  state.perkSlotOrder.forEach((instanceId) => {
+    const perk = instanceId != null ? byInstanceId.get(instanceId) : null;
+    if (!perk) {
+      const slot = document.createElement("div");
+      slot.className = "perk-slot";
+      row.appendChild(slot);
+      return;
+    }
     const card = document.createElement("div");
-    card.className = "perk-card" + (perk.tint ? ` tint-${perk.tint}` : "");
+    card.className = "perk-card" + (perk.tint ? ` tint-${perk.tint}` : "") + (perk.blessingCensorDuplicate ? " blessing-censor-duplicate" : "");
     card.textContent = perk.name;
     attachCardTilt(card);
     if (perk.shiny) decorateShiny(card);
@@ -4227,17 +5464,6 @@ function buildOwnedPerksSummary() {
 
     row.appendChild(card);
   });
-  // Empty slots too, same bare placeholder markup as the real perk-slots
-  // row (renderPerks()) - otherwise "how many do I actually have open right
-  // now" (extraPerkSlot/shiny copies included, via effectivePerkSlotCount())
-  // wasn't visible at all in this read-only snapshot, only on the board
-  // underneath the popup.
-  const emptyCount = Math.max(0, effectivePerkSlotCount() - owned.length);
-  for (let i = 0; i < emptyCount; i++) {
-    const slot = document.createElement("div");
-    slot.className = "perk-slot";
-    row.appendChild(slot);
-  }
   wrap.appendChild(row);
   return wrap;
 }
@@ -4256,7 +5482,7 @@ function renderRuleInventory() {
     const rule = RULE_POOL.find((r) => r.id === id);
     const count = instances.length;
     // Savings Bond and Make it count copies each have their own independent
-    // progress (locked amount / games remaining), so a plain "stacks" desc
+    // progress (locked amount / Bosses remaining), so a plain "stacks" desc
     // would hide that - list each one's own state instead of just repeating
     // the card's static description.
     let desc = rule.desc;
@@ -4270,8 +5496,19 @@ function renderRuleInventory() {
     } else if (id === "makeItCount") {
       desc = `${rule.desc} ` + instances
         .map((inst) => {
-          const gamesLeft = inst.gamesRemaining || 0;
-          return `${gamesLeft} game${gamesLeft === 1 ? "" : "s"} left.`;
+          const bossesLeft = inst.bossesRemaining || 0;
+          return `${bossesLeft} Boss${bossesLeft === 1 ? "" : "es"} left.`;
+        })
+        .join(" ");
+    } else if (id === "fireSale") {
+      // shopsRemaining counts the shop it's currently sitting in as the
+      // first covered one (see its own apply()/tickFireSale()) - "This
+      // shop" here is that one, so the number after it is everything AFTER
+      // the current shop, not the raw remaining count itself.
+      desc = `${rule.desc} ` + instances
+        .map((inst) => {
+          const afterThisShop = Math.max(0, (inst.shopsRemaining || 0) - 1);
+          return `This shop + ${afterThisShop} shop${afterThisShop === 1 ? "" : "s"} left.`;
         })
         .join(" ");
     } else if (id === "luckySkip") {
@@ -4280,14 +5517,22 @@ function renderRuleInventory() {
       // running total instead of per-copy state.
       desc = `${rule.desc} Current bonus: +${formatPercent(state.luckySkipBonus)} (Shiny/Boosted now at ${formatPercent(effectiveShinyChance())}, Mega now at ${formatPercent(effectiveMegaChance())}).`;
     } else if (id === "basePoints") {
-      // Each copy locked in its own random category at pick time - list
-      // which one, same per-instance pattern as Savings Bond/Make it Count.
-      desc = `${rule.desc} ` + instances
-        .map((inst) => {
-          const cat = CAT_BY_KEY[inst.categoryKey];
-          return `+${BASE_POINTS_BONUS} to ${cat ? cat.name : "?"}.`;
-        })
-        .join(" ");
+      // Each copy locked in its own random category at pick time - group by
+      // category first (2+ copies landing on the same one combine into a
+      // single summed line, matching basePointsBonusFor()'s own per-
+      // category sum rather than repeating that category's line once per
+      // copy), one row per category via the \n's (see .perk-tooltip's own
+      // white-space: pre-line in style.css, needed for these to actually
+      // render as line breaks instead of collapsing to spaces).
+      const basePointsByCategory = new Map(); // category key -> summed bonus
+      instances.forEach((inst) => {
+        basePointsByCategory.set(inst.categoryKey, (basePointsByCategory.get(inst.categoryKey) || 0) + BASE_POINTS_BONUS);
+      });
+      const basePointsLines = [...basePointsByCategory.entries()].map(([catKey, amount]) => {
+        const cat = CAT_BY_KEY[catKey];
+        return `+${amount} to ${cat ? cat.name : "?"}`;
+      });
+      desc = `${rule.desc}\n` + basePointsLines.join("\n");
     } else if (id === "fireSale") {
       const shopsLeft = instances[0].shopsRemaining || 0;
       desc = `${rule.desc} ${shopsLeft} shop${shopsLeft === 1 ? "" : "s"} left.`;
@@ -4513,7 +5758,14 @@ function removePerkInstance(index, { animate = true } = {}) {
   if (removed.id === "goldenTouch") flushPendingGoldenTouchCue();
   growXMultPerk("demolisher", DEMOLISHER_MULT_STEP);
   resizeDiceArraysToCount(state.diceCount);
-  rerollDoubleTarget(); // All Luck / Hotline ownership may have just changed
+  // Only reroll when the card actually lost was Hotline/All Luck itself
+  // (doubleOrNothingTargetCount() depends on nothing else - see there) -
+  // losing anything else was still calling this unconditionally, rerolling
+  // Hotline's own already-picked target categories for no reason every
+  // time an unrelated perk (a Blessing duplicate, a Perk Reroll Token
+  // reroll, a plain trash) was removed, even with Hotline's own ownership
+  // completely untouched.
+  if (removed.id === "doubleOrNothing" || removed.id === "frequentFlyer") rerollDoubleTarget();
   return removed;
 }
 
@@ -4535,11 +5787,24 @@ function showTrashGainCue(amount) {
   const gainEl = perkTrash.querySelector(".perk-trash-gain");
   gainEl.textContent = `+$${amount}`;
   gainEl.classList.remove("hidden");
+  gainEl.style.display = ""; // belt-and-suspenders, see the hide side's own comment below
   gainEl.style.animation = "none";
   void gainEl.offsetWidth; // force reflow so the animation restarts even if it's already mid-play
-  gainEl.style.animation = "";
+  // Set as an explicit inline value, not "" (which used to fall back to a
+  // static animation: declaration on .perk-trash-gain itself - removed,
+  // see that rule's own comment in style.css for why that let this
+  // element's cue auto-play once on a bare page load, unprompted).
+  gainEl.style.animation = "trashGainFloat 900ms ease-out forwards";
   setTimeout(() => {
     gainEl.classList.add("hidden");
+    // Explicit inline display:none, not just the class - .hidden's
+    // display:none can fail to actually apply to this element on its own
+    // (a real, reproduced browser-level style-computation quirk, not
+    // anything wrong with the class or the code driving it - see
+    // index.html's own inline style="display:none" on this element for
+    // the other half of this fix, covering its very first, pre-JS state).
+    // An inline style is highest-priority in the cascade and sidesteps it.
+    gainEl.style.display = "none";
     perkTrash.classList.add("hidden");
     perkTrashIcon.textContent = PERK_TRASH_IDLE_ICON;
   }, 900);
@@ -4552,14 +5817,24 @@ function showTrashGainCue(amount) {
 // (moneyGainCue, not goldenTouchGainCue below) so a Golden Touch refund
 // message landing in this same spot moments later never gets cut off by an
 // unrelated gain's cue, or vice versa.
-const MONEY_GAIN_CUE_DURATION = 900;
+const MONEY_GAIN_CUE_DURATION = 1400; // was 900 - slowed by 0.5s per playtest feedback
 function showMoneyGainCue(amount) {
   moneyGainCue.textContent = `+$${amount}`;
   moneyGainCue.classList.remove("hidden");
+  moneyGainCue.style.display = ""; // belt-and-suspenders, see the hide side's own comment below
   moneyGainCue.style.animation = "none";
   void moneyGainCue.offsetWidth; // force reflow so the animation restarts even if it's already mid-play
-  moneyGainCue.style.animation = "";
-  setTimeout(() => moneyGainCue.classList.add("hidden"), MONEY_GAIN_CUE_DURATION);
+  // Set as an explicit inline value, not "" (which used to fall back to a
+  // static animation: declaration on .money-gain-cue itself - removed,
+  // see that rule's own comment in style.css for why that let this
+  // element's cue auto-play once on a bare page load, unprompted).
+  moneyGainCue.style.animation = `moneyGainFloat ${MONEY_GAIN_CUE_DURATION}ms ease-out forwards`;
+  setTimeout(() => {
+    moneyGainCue.classList.add("hidden");
+    // Explicit inline display:none, not just the class - see
+    // showTrashGainCue()'s own hide step for why.
+    moneyGainCue.style.display = "none";
+  }, MONEY_GAIN_CUE_DURATION);
 }
 
 // Golden Touch's refund message - anchored to the Money stat, same
@@ -4579,12 +5854,25 @@ let goldenTouchCueShownAt = null;
 function showGoldenTouchCue(amount) {
   goldenTouchGainCue.textContent = `Golden Touch activated, Refunded $${amount}`;
   goldenTouchGainCue.classList.remove("hidden");
+  goldenTouchGainCue.style.display = ""; // belt-and-suspenders, see the hide side's own comment below
   goldenTouchGainCue.style.animation = "none";
   void goldenTouchGainCue.offsetWidth; // force reflow so the animation restarts even if it's already mid-play
-  goldenTouchGainCue.style.animation = "";
+  // Set as an explicit inline value, not "" (which used to fall back to a
+  // static animation: declaration on .golden-touch-gain itself - removed,
+  // see that rule's own comment in style.css for why).
+  goldenTouchGainCue.style.animation = "goldenTouchMessageFade 2200ms ease-out forwards";
   goldenTouchCueShownAt = Date.now();
   setTimeout(() => {
     goldenTouchGainCue.classList.add("hidden");
+    // Explicit inline display:none, not just the class - confirmed live
+    // that .hidden's display:none can fail to actually apply to this
+    // element on its own (a real, reproduced browser-level style-
+    // computation quirk on this specific sibling-element layout, not
+    // anything wrong with the class or the code driving it - see
+    // index.html's own inline style="display:none" on this element for
+    // the other half of this fix, covering its very first, pre-JS state).
+    // An inline style is highest-priority in the cascade and sidesteps it.
+    goldenTouchGainCue.style.display = "none";
     goldenTouchCueShownAt = null;
   }, GOLDEN_TOUCH_CUE_DURATION);
 }
@@ -4668,7 +5956,7 @@ function renderStats() {
   // spark burst and a "+$N" cue alongside the usual count-up pulse.
   const moneyBefore = lastKnownMoney;
   lastKnownMoney = state.money;
-  animateCountUp(statMoney, state.money);
+  animateCountUp(statMoney, state.money, 1500); // was the default 1000ms - slowed by 0.5s per playtest feedback
   if (state.money > moneyBefore) {
     const gain = state.money - moneyBefore;
     triggerMoneySparkBurst(gain);
@@ -4682,6 +5970,7 @@ function renderStats() {
   // never fired - it can only ever be a frame late, never indefinitely stuck.
   if (goldenTouchCueShownAt !== null && Date.now() - goldenTouchCueShownAt > GOLDEN_TOUCH_CUE_DURATION) {
     goldenTouchGainCue.classList.add("hidden");
+    goldenTouchGainCue.style.display = "none"; // see showGoldenTouchCue()'s own hide step for why this inline style is needed alongside the class
     goldenTouchCueShownAt = null;
   }
 }
@@ -4872,11 +6161,17 @@ function renderMainGameModifier() {
 function renderNextBossLabel() {
   if (state.phase === "main" || state.nextMainGameModifierIndex == null) {
     nextBossLabel.classList.add("hidden");
+    // No longer a descendant of nextBossLabel (see index.html/.next-boss-
+    // usable-badge in style.css - it's pinned to its own corner now), so
+    // hiding the label doesn't hide this along with it anymore - needs its
+    // own explicit hide here.
+    nextBossUsableBadge.classList.add("hidden");
     return;
   }
   const boss = MAIN_GAME_MODIFIERS[state.nextMainGameModifierIndex];
   if (!boss) {
     nextBossLabel.classList.add("hidden");
+    nextBossUsableBadge.classList.add("hidden");
     return;
   }
   const categoryClass = boss.tint ? ` tint-${boss.tint}` : (boss.category !== "dice" ? ` category-${boss.category}` : "");
@@ -4889,27 +6184,13 @@ function renderNextBossLabel() {
   // entirely rather than showing empty green text with a blank tooltip.
   const usable = USABLE_POOL.find((u) => u.id === state.nextBossUsableOffer);
   nextBossUsableBadge.classList.toggle("hidden", !usable);
-  nextBossUsableBadgeText.textContent = usable ? usable.name : "";
+  nextBossUsableBadgeText.textContent = usable ? `Item: ${usable.name}` : "";
   nextBossUsableTooltip.textContent = usable
     ? `Boss shop item: ${usable.name} ($${usable.cost}) - ${usable.desc}`
     : "";
 }
 attachClampedTooltip(nextBossLabel, nextBossTooltip, diceArea);
 attachClampedTooltip(nextBossUsableBadge, nextBossUsableTooltip, diceArea);
-// The badge is a DOM descendant of nextBossLabel, so CSS :hover on the
-// label is ALSO true the instant the badge itself is hovered (the pointer
-// is still within the label's own box) - without this, that would pop the
-// label's own boss tooltip up at the same time as the badge's, overlapping
-// it. Forcing the label tooltip's opacity off for as long as the badge
-// specifically is hovered (inline style beats the class-based CSS rule)
-// keeps the two mutually exclusive; clearing the override on mouseleave
-// hands control back to the plain CSS :hover rule for the rest of the label.
-nextBossUsableBadge.addEventListener("mouseenter", () => {
-  nextBossTooltip.style.opacity = "0";
-});
-nextBossUsableBadge.addEventListener("mouseleave", () => {
-  nextBossTooltip.style.opacity = "";
-});
 
 function renderControls() {
   // Mulligan: shown whenever there's an actual last commit to undo
@@ -4938,7 +6219,11 @@ function renderControls() {
     }
     rollsLeftEl.textContent = "";
     rollBtn.disabled = coinDieRevealActive;
-    rollBtn.textContent = state.phase === "main" ? "Next Level" : "Next Round";
+    // Small2's own shop is the one point where clicking through actually
+    // starts the boss (small1's own "Next Round" instead leads into small2,
+    // another small game - not a boss) - call that out by name so the
+    // player knows exactly what they're about to walk into.
+    rollBtn.textContent = state.phase === "main" ? "Next Level" : (state.phase === "small2" ? "Boss" : "Next Round");
     rollBtn.classList.remove("roll-btn-skip");
     mulliganBtn.classList.toggle("mulligan-btn-hidden", mulliganHidden);
     updateDangerVignette(null);
@@ -5236,6 +6521,14 @@ const LUCKY_DIE_CUE_MS = 2600; // how long the floating "Lucky Die: ..." label s
 // - unlike playScoreCommitAnimation() itself, which only ever plays in the
 // main game, this still shows for a small-game money hit.
 function playLuckyDieCue(luckyDieResult) {
+  // The "double" outcome doubles bankedScore, which only ever matters in
+  // the main game (small games pay money off a flat per-category amount,
+  // never off the score itself) - showing "2X Final Score" there would be
+  // announcing a bonus that did nothing, so skip the cue entirely rather
+  // than show a pulse with no real payoff behind it. The "money" outcome
+  // stays phase-independent (see this function's own header comment).
+  if (luckyDieResult.type === "double" && state.phase !== "main") return;
+
   const scene = diceTray.children[luckyDieResult.dieIndex];
   if (!scene) return; // diceCount shrank since the mark was picked - nothing to show
 
@@ -5557,6 +6850,13 @@ function rollDice() {
 const SCORE_COMMIT_BASE_COUNT_MS = 800;
 const SCORE_COMMIT_MULT_PAUSE_MS = 900;
 const SCORE_COMMIT_STAGE_COUNT_MS = 700;
+// Matches @keyframes catScoreCommitPunch's own duration in style.css.
+const SCORE_COMMIT_PUNCH_MS = 350;
+// Toggle for the final "lands with a punch" beat added to afterAllStages()
+// below - flip to false to revert to the plain flat landing (just the
+// number/color settling, no extra animation) without touching anything
+// else in the reveal sequence.
+const SCORE_COMMIT_PUNCH_ENABLED = true;
 
 // Category keys with a playScoreCommitAnimation() sequence currently in
 // flight - see renderScorecard()'s preservedRows, which keeps each of these
@@ -5687,6 +6987,15 @@ function playScoreCommitAnimation(key, breakdown, doubled, thisTurnScore, banked
   const afterAllStages = () => {
     scoreTd.textContent = String(bankedScore);
     scoreTd.style.color = SCORE_COMMIT_COLOR_CATMULT; // settle back to orange
+    if (SCORE_COMMIT_PUNCH_ENABLED) {
+      // Restart cleanly even if a same-length animation from a prior stage
+      // is still technically "active" for one more frame - same
+      // remove/reflow/re-add dance used for the dice bounce restart.
+      scoreTd.classList.remove("cat-score-commit-punch");
+      void scoreTd.offsetWidth;
+      scoreTd.classList.add("cat-score-commit-punch");
+      setTimeout(() => scoreTd.classList.remove("cat-score-commit-punch"), SCORE_COMMIT_PUNCH_MS);
+    }
     scoreCommitAnimatingKeys.delete(key);
   };
   // Double Down Token's own double - the true last stage, after even Lucky
@@ -5806,7 +7115,12 @@ function commitScore(key) {
   // whatever multiplier actually applied to this hand, never a stale or
   // not-yet-applied one).
   if (state.phase === "main") updateStreaker(thisTurnScore > 0);
-  growStraightShot(key, thisTurnScore > 0);
+  // Straight Shot: main-game only, same reasoning as Streaker just above -
+  // its xMultCondition/badge/total already only ever apply in the main
+  // game (see xMultIsActiveForDisplay()'s own state.phase check), so a
+  // small-game Straight committed while owning it must not grow it either,
+  // even though small games can still commit into the same category keys.
+  if (state.phase === "main") growStraightShot(key, thisTurnScore > 0);
   // Same "did this genuinely hit" gate scoreBreakdownForCategory() itself
   // used before it ever called streakDieBonusFor() - a whiff (rawHand <= 0)
   // never had its assumed growth counted into breakdown.bonusTotal in the
@@ -5871,7 +7185,10 @@ function finishCommitScore(key, breakdown, raw, doubled, thisTurnScore, bankedSc
   // whiff (raw <= 0, e.g. zeroing Ones in the main game) never gets the
   // bonus added by scoreWithCategoryBonus() in the first place.
   const basePointsBonus = raw > 0 ? basePointsBonusFor(key) : 0;
-  let bannerLabel = basePointsBonus > 0 ? `${CAT_BY_KEY[key].name} +${basePointsBonus} points` : CAT_BY_KEY[key].name;
+  // Just the category name - no "+N points" from Base Points here (that
+  // breakdown already shows on the scorecard/tooltip; the banner is only
+  // ever meant to announce which hand was just played).
+  let bannerLabel = CAT_BY_KEY[key].name;
   // Double Down Token consumed on this exact commit - the only visible cue
   // the player gets that it actually triggered (no separate "primed"
   // indicator beforehand, same as Lucky Die's own reveal-only-on-commit
@@ -5914,14 +7231,20 @@ function finishCommitScore(key, breakdown, raw, doubled, thisTurnScore, bankedSc
   // The Taxman's own wording has only ever been about money.
   const taxmanBlocksMoney = activeBossModifier()?.id === "theTaxman";
 
-  // Coin Die: independent of category, phase, or whether the hand actually
-  // scored - purely "was this exact die showing its marked face the moment
-  // you committed." Checked directly against state.dice (already final by
-  // the time a commit can happen), not the score breakdown.
-  const coinDieGain = coinDieMoneyGain(state.dice);
+  // Coin Die: pays out per marked die that's both showing its marked face
+  // AND actually contributing to the category being committed (see
+  // coinDiePayoutInstances()) - checked directly against state.dice
+  // (already final by the time a commit can happen), not the score
+  // breakdown. Flashed on the tray die itself (flashCoinDiePayout()) right
+  // here, before anything below rebuilds the tray for the next hand -
+  // that rebuild would otherwise destroy the die element before its own
+  // one-shot animation ever got a frame to paint.
+  const coinDiePayouts = coinDiePayoutInstances(state.dice, key, activeWildIndices());
+  const coinDieGain = coinDiePayouts.length * COIN_DIE_PAYOUT;
   if (coinDieGain > 0 && !taxmanBlocksMoney) {
     state.money += coinDieGain;
     highlightedRuleCardIds.add("coinDie");
+    coinDiePayouts.forEach((p) => flashCoinDiePayout(p.dieIndex));
   }
 
   // Lucky Die's money outcome - already resolved once in commitScore()
@@ -5969,12 +7292,26 @@ function finishCommitScore(key, breakdown, raw, doubled, thisTurnScore, bankedSc
     justReachedTarget = true;
   }
 
-  if (state.turn >= turnLimit()) {
-    // Board's full regardless - normal ending either way.
-    endLevel();
-    return;
-  }
+  // Every active category already has a score and the target still isn't
+  // met - normally running out of turns (the check just below) is what
+  // catches this, but The Turnkey lets the same category be recommitted
+  // indefinitely (and turnLimit() deliberately excludes it from the
+  // fillable-categories cap - see turnLimit()'s own comment), so a level
+  // under The Turnkey could otherwise never actually run out of turns even
+  // with literally nowhere left to improve the score. This check is what
+  // actually ends it once there's truly no way left to catch up.
+  const allCategoriesFilledShortOfTarget = state.phase === "main"
+    && currentTotalScore() < state.target
+    && activeCategories().every((cat) => state.scorecard[cat.key] != null);
 
+  // Checked BEFORE the "turns ran out" branch below, not after - a win that
+  // happens to land on the exact last turn is still a win, and deserves the
+  // exact same "Next Level" confirmation step every OTHER win gets (see
+  // this branch's own comment), not a hard cut straight to the perk-choice
+  // modal just because turnLimit() and the target were both hit in the same
+  // commit. (Mutually exclusive with allCategoriesFilledShortOfTarget below
+  // by construction - that one only ever fires when the score is still
+  // UNDER target, so checking justReachedTarget first never suppresses it.)
   if (justReachedTarget) {
     // Turns left over: stop play immediately rather than letting the player
     // keep filling out the rest of the board - Throw Dice becomes Next
@@ -5998,6 +7335,12 @@ function finishCommitScore(key, breakdown, raw, doubled, thisTurnScore, bankedSc
     return;
   }
 
+  if (state.turn >= turnLimit() || allCategoriesFilledShortOfTarget) {
+    // Board's full regardless - normal ending either way.
+    endLevel();
+    return;
+  }
+
   state.turn++;
   state.dice = freshDice(state.diceCount);
   state.dieRotation = freshDieRotations(state.diceCount);
@@ -6008,7 +7351,8 @@ function finishCommitScore(key, breakdown, raw, doubled, thisTurnScore, bankedSc
   state.bossForcedRerollDieIndex = null; // The Tempest: re-picked fresh next hand
   state.viceLockedIndices = []; // The Vice: fully free again next hand
   refreshGatekeeperBlocks(); // The Gatekeeper: re-picked fresh next turn
-  chargeLandlordRent(); // The Landlord: this new turn's rent is due now
+  refreshBlessingGatekeeperBoosts(); // Blessing of The Gatekeeper: same, reversed
+  chargeLandlordRent(); // The Landlord: this new turn's rent is due now (Blessing of The Landlord's own gain is charged inside this same call)
   rerollDoubleTarget();
 
   renderAll();
@@ -6234,10 +7578,15 @@ function showTurnsLeftBonusCue(turnsLeft) {
 
   setTimeout(() => {
     // The Taxman: the "N left" cue still shows (still useful information),
-    // it just never turns into money - see activeBossModifier().
+    // it just never turns into money - see activeBossModifier(). Blessing
+    // of The Taxman reverses that same conversion into a 3x rate instead,
+    // independent of which boss actually rolled - both can never fire in
+    // the same commit (blocked/tripled are mutually exclusive branches
+    // here), so there's no risk of them fighting over the same payout.
     if (activeBossModifier()?.id !== "theTaxman") {
-      state.money += turnsLeft;
-      animateCountUp(statMoney, state.money, 1200);
+      const gain = hasBlessing("blessing_theTaxman") ? turnsLeft * BLESSING_TAXMAN_MULTIPLIER : turnsLeft;
+      state.money += gain;
+      animateCountUp(statMoney, state.money, 1700); // was 1200 - slowed by 0.5s per playtest feedback, same as the everyday count-up
       // This bypasses renderStats()'s own before/after comparison (it
       // mutates and animates statMoney directly), so the spark burst and
       // "+$N" cue that every other gain gets need to be triggered by hand
@@ -6246,8 +7595,8 @@ function showTurnsLeftBonusCue(turnsLeft) {
       // the renderStats() call below (once the "N left" cue itself fades)
       // would otherwise still see the stale pre-bonus value there and
       // re-fire this exact same gain's cue all over again.
-      triggerMoneySparkBurst(turnsLeft);
-      showMoneyGainCue(turnsLeft);
+      triggerMoneySparkBurst(gain);
+      showMoneyGainCue(gain);
       lastKnownMoney = state.money;
     }
     saveState();
@@ -6256,7 +7605,135 @@ function showTurnsLeftBonusCue(turnsLeft) {
   setTimeout(() => {
     statTurn.classList.remove("turn-cue");
     renderStats(); // restore the normal "turn / limit" display
+    // The money just banked above can be enough to afford the boss usable
+    // offer (or, in a small game, a shop slot) - without this, that card
+    // stayed stuck showing its pre-bonus "disabled/greyed out" state until
+    // some unrelated later render happened to refresh it (a page reload,
+    // for instance).
+    renderPackShop();
   }, 1200);
+}
+
+// Durations for Extra Life's save flourish (see endLevel()'s own
+// extraLifeIndex branch) - morph up to full size, a beat to register it,
+// a shake, then the split-and-fly-apart.
+const EXTRA_LIFE_MORPH_MS = 700;
+const EXTRA_LIFE_HOLD_MS = 350;
+const EXTRA_LIFE_SHAKE_MS = 450;
+const EXTRA_LIFE_SPLIT_MS = 600;
+// pack-card-large's own fixed size (see style.css) - the morph clone
+// grows to exactly this, centered, so it reads as the same "card reveal"
+// language the rest of the game already uses (pack openings, level-up
+// picks), not a one-off size invented just for this.
+const EXTRA_LIFE_CARD_W = 140;
+const EXTRA_LIFE_CARD_H = 180;
+
+// Extra Life's own perk-slot card morphs into a full-size centered card
+// (a FLIP-clone, same technique as playChoicePickAnimation()'s morph, just
+// growing into the middle of the screen instead of shrinking into a slot -
+// the real card can't be animated directly since it's about to be
+// destroyed by removePerkInstance()), shakes, then splits into two halves
+// that fly off the top and bottom of the screen. onDone fires once the
+// whole sequence has finished, after the halves are gone - see its caller
+// in endLevel() for what happens next (the actual removal + level advance,
+// which per-design comes AFTER this completes, not concurrently with it,
+// so the flourish always gets to finish reading clearly).
+function playExtraLifeSaveAnimation(perk, cardEl, onDone) {
+  if (!cardEl) { onDone(); return; }
+
+  const fromRect = cardEl.getBoundingClientRect();
+  cardEl.style.visibility = "hidden"; // the clone below takes over visually
+
+  const clone = document.createElement("div");
+  clone.className = "extra-life-card-visual extra-life-save-clone";
+  const name = document.createElement("div");
+  name.className = "pack-card-name";
+  name.textContent = perk.name;
+  const desc = document.createElement("div");
+  desc.className = "pack-card-rule-desc";
+  desc.textContent = perk.desc;
+  clone.appendChild(name);
+  clone.appendChild(desc);
+  clone.style.left = `${fromRect.left}px`;
+  clone.style.top = `${fromRect.top}px`;
+  clone.style.width = `${fromRect.width}px`;
+  clone.style.height = `${fromRect.height}px`;
+  document.body.appendChild(clone);
+
+  const targetLeft = (window.innerWidth - EXTRA_LIFE_CARD_W) / 2;
+  const targetTop = (window.innerHeight - EXTRA_LIFE_CARD_H) / 2;
+  requestAnimationFrame(() => {
+    clone.style.left = `${targetLeft}px`;
+    clone.style.top = `${targetTop}px`;
+    clone.style.width = `${EXTRA_LIFE_CARD_W}px`;
+    clone.style.height = `${EXTRA_LIFE_CARD_H}px`;
+  });
+
+  setTimeout(() => {
+    setTimeout(() => {
+      clone.classList.add("extra-life-save-clone-shake");
+      setTimeout(() => {
+        // Split: swap the single grown clone for two identically-placed
+        // halves, each clipped to only show its own top/bottom - together
+        // they still read as the one whole card at this exact instant,
+        // right before flying apart.
+        const rect = clone.getBoundingClientRect();
+        clone.remove();
+
+        function buildHalf(kind) {
+          const half = document.createElement("div");
+          half.className = `extra-life-card-visual extra-life-save-half extra-life-save-half-${kind}`;
+          const halfName = document.createElement("div");
+          halfName.className = "pack-card-name";
+          halfName.textContent = perk.name;
+          const halfDesc = document.createElement("div");
+          halfDesc.className = "pack-card-rule-desc";
+          halfDesc.textContent = perk.desc;
+          half.appendChild(halfName);
+          half.appendChild(halfDesc);
+          half.style.left = `${rect.left}px`;
+          half.style.top = `${rect.top}px`;
+          half.style.width = `${rect.width}px`;
+          half.style.height = `${rect.height}px`;
+          document.body.appendChild(half);
+          return half;
+        }
+        const topHalf = buildHalf("top");
+        const bottomHalf = buildHalf("bottom");
+        // Force layout/style to actually commit the halves' just-appended
+        // starting state before the target transform/opacity get set below
+        // - without this, both changes can end up getting batched into the
+        // same style recalc and the transition never gets a "from" value
+        // to interpolate away from, so it jumps straight to the target
+        // instead of animating (confirmed live). Same reflow-forcing
+        // trick used elsewhere in this file (search offsetWidth) for
+        // restarting an animation that might already be mid-play - same
+        // underlying need here, just for a brand-new element's first one.
+        void topHalf.offsetWidth;
+        void bottomHalf.offsetWidth;
+
+        // Explicit inline transform/opacity values, not a class toggle -
+        // confirmed live that adding a class to set the *target* of a
+        // transition on a freshly-created element can snap straight there
+        // instead of actually interpolating (same class of issue as the
+        // money-cue animation bugs earlier this session). Setting the
+        // values directly here, the same way the morph clone above sets
+        // its own left/top/width/height targets, is what actually animates.
+        requestAnimationFrame(() => {
+          topHalf.style.transform = "translateY(-140vh) rotate(-10deg)";
+          topHalf.style.opacity = "0";
+          bottomHalf.style.transform = "translateY(140vh) rotate(10deg)";
+          bottomHalf.style.opacity = "0";
+        });
+
+        setTimeout(() => {
+          topHalf.remove();
+          bottomHalf.remove();
+          onDone();
+        }, EXTRA_LIFE_SPLIT_MS);
+      }, EXTRA_LIFE_SHAKE_MS);
+    }, EXTRA_LIFE_HOLD_MS);
+  }, EXTRA_LIFE_MORPH_MS);
 }
 
 function endLevel() {
@@ -6280,11 +7757,24 @@ function endLevel() {
   } else {
     const extraLifeIndex = state.perksOwned.findIndex((p) => p.id === "extraLife");
     if (extraLifeIndex !== -1) {
-      // Destroyed on use, not through the trash can - no refund, and it
-      // skips straight past the perk-choice modal into the next level.
-      removePerkInstance(extraLifeIndex);
-      saveState();
-      startNextLevel();
+      const extraLifeInstance = state.perksOwned[extraLifeIndex];
+      const extraLifeSlotIndex = state.perkSlotOrder.indexOf(extraLifeInstance.instanceId);
+      const extraLifeCardEl = extraLifeSlotIndex !== -1 ? perkSlots.children[extraLifeSlotIndex] : null;
+      playExtraLifeSaveAnimation(extraLifeInstance, extraLifeCardEl, () => {
+        // Destroyed on use, not through the trash can - no refund, and it
+        // skips straight past the perk-choice modal into the next level.
+        // Re-looks-up its index (rather than reusing extraLifeIndex from
+        // above) since nothing guarantees perksOwned's order survived the
+        // ~2s the save animation just took unchanged. animate: false -
+        // playExtraLifeSaveAnimation() just played its own, much more
+        // elaborate flourish in this exact card's place - the plain
+        // dissolve removePerkInstance() otherwise gives every other
+        // removal would just be a redundant second animation stacked
+        // right on top of it.
+        removePerkInstance(state.perksOwned.indexOf(extraLifeInstance), { animate: false });
+        saveState();
+        startNextLevel();
+      });
     } else {
       showGameOverModal(total);
     }
@@ -6345,20 +7835,27 @@ function showNextRoundPrompt() {
   state.refreshCost = REFRESH_COST_BASE;
   state.rerollCountThisShop = 0;
   state.freeRerollActive = false;
-  // Third Time's the Charm: this shop is one of the (up to 2) locked ones
-  // queued up by reaching the discount in an earlier shop, once the boss
-  // that followed it concluded (see startNextLevel()'s "main just finished"
-  // branch) - drain one charge per shop presentation, locking purchases
-  // here for as long as any remain.
+  // Third Time's the Charm and Fire Sale each queue up their own (up to 2)
+  // locked shops once the boss that followed their own trigger concluded
+  // (see startNextLevel()'s "main just finished" branch) - drain one charge
+  // from EACH independently per shop presentation, locking purchases here
+  // for as long as either still has one remaining. Independent counters
+  // (not a single shared one) so owning both at once, mid-cycle, doesn't
+  // let one swallow the other's charge - the shop only ever unlocks once
+  // BOTH have fully drained.
+  let locked = false;
   if (state.thirdTimesCharmLocksRemaining > 0) {
-    state.shopPurchasesLocked = true;
+    locked = true;
     state.thirdTimesCharmLocksRemaining -= 1;
-  } else {
-    state.shopPurchasesLocked = false;
   }
-  // A small game just concluded - one of Make it count's 3 games is spent,
-  // and this fresh shop uses up one of Fire Sale's 2 covered shops.
-  tickMakeItCount();
+  if (state.fireSaleLocksRemaining > 0) {
+    locked = true;
+    state.fireSaleLocksRemaining -= 1;
+  }
+  state.shopPurchasesLocked = locked;
+  // Make it Count is boss-only now (see tickMakeItCount()'s own comment) -
+  // a small game concluding never spends one of its charges, only this
+  // fresh shop using up one of Fire Sale's own covered ones.
   tickFireSale();
   rollShopSlots();
   pendingShopFlipIn = true;
@@ -6516,8 +8013,21 @@ function refreshShopSlots() {
   // next boss concludes. The discount itself needs no arming at all -
   // hasThirdTimesCharmDiscount() just reads rerollCountThisShop live, once
   // it's incremented past the trigger a few lines down.
+  //
+  // Only arms when no lock cycle is already in flight (neither a pending
+  // one waiting for the next boss, nor one already being served right now)
+  // - refreshShopSlots() has no guard against being called during an
+  // ALREADY-locked shop (Refresh isn't blocked by shopPurchasesLocked,
+  // unlike buying a pack), so reaching the 3rd reroll while serving out an
+  // existing lock used to re-arm a SECOND one on top of it, extending the
+  // "locked for 2 shops" punishment indefinitely - reported live as shops
+  // staying randomly locked for the rest of the run. One lock cycle at a
+  // time: earning the discount again while one's already pending/active
+  // just doesn't queue up another.
   if (state.rerollCountThisShop === THIRD_TIMES_CHARM_TRIGGER_REROLL_INDEX
-    && state.perksOwned.some((p) => p.id === "thirdTimesTheCharm")) {
+    && state.perksOwned.some((p) => p.id === "thirdTimesTheCharm")
+    && !state.thirdTimesCharmPendingBossLock
+    && state.thirdTimesCharmLocksRemaining === 0) {
     state.thirdTimesCharmPendingBossLock = true;
   }
   state.rerollCountThisShop += 1;
@@ -6586,7 +8096,7 @@ function sampleRuleIds(n) {
 function openCardPack(packType, slotIndex) {
   const price = effectiveCardPackPrice(packType);
   if (!state.awaitingNextRound || state.pendingPackOffer || state.money < price) return;
-  if (state.shopPurchasesLocked) return; // Third Time's the Charm: this shop is locked
+  if (state.shopPurchasesLocked) return; // Third Time's the Charm or Fire Sale: this shop is locked
   if (state.shopSlots[slotIndex] !== packType.name) return; // stale click target
   // A lingering Mulligan snapshot (see captureMulliganSnapshot()) predates
   // this whole shop - useMulligan() deliberately keeps shopSlots/refreshCost
@@ -6639,7 +8149,13 @@ function openCardPack(packType, slotIndex) {
     const perks = samplePerks(state, packType.cardCount);
     state.pendingPackOffer = perks.map((p) => p.id);
     state.pendingPackBoostedKeys = [];
-    state.pendingPackShinyKeys = perks.filter(() => Math.random() < effectiveShinyChance()).map((p) => p.id);
+    // Extra Perk excluded - it never renders its own card (see
+    // isSlotOccupyingPerk), so Shiny would have nothing to visibly decorate
+    // and no effect to apply to (its own slot-capacity bump is flat either
+    // way) - a wasted roll the player could never even see.
+    state.pendingPackShinyKeys = perks
+      .filter((p) => p.id !== "extraPerkSlot" && Math.random() < effectiveShinyChance())
+      .map((p) => p.id);
     // Same fresh-start guarantee as the rule branch above.
     selectedPerkPackId = null;
     selectedPerkPackReplaceIndex = null;
@@ -6655,11 +8171,16 @@ function openCardPack(packType, slotIndex) {
   saveState();
 }
 
-// Declines every offered card - the pack was still bought (money and the
-// shop slot are already spent), this just means walking away with no
-// category bonus (or rule) from it.
-function skipPackOffer() {
-  if (!state.pendingPackOffer) return;
+// The Skipper/Lucky Skip growth every single way of declining an offered
+// card grants - a Card/Rule/Perk Pack's own Skip (skipPackOffer()), a
+// Blessing Pack's own Skip (skipBlessingOffer()), and the level-up "Choose a
+// Perk"/"Perk Slots Full" steps' own Skip buttons (showLevelCompleteModal())
+// alike. Pulled into one shared function specifically because the level-up
+// pair originally missed it entirely (they called startNextLevel() straight
+// away, no growth at all) despite every OTHER skip path already granting
+// it - a single shared call site means a future 5th skip path can't quietly
+// repeat that mistake.
+function grantSkipGrowth() {
   // Lucky Skip: banked permanently the moment the skip happens, not
   // recomputed later - so losing the card afterward never claws it back.
   const luckySkipStacks = state.perksOwned.filter((p) => p.id === "luckySkip").length;
@@ -6667,6 +8188,14 @@ function skipPackOffer() {
   // Skipper: every owned copy's own xMult grows, same permanent-and-never-
   // resetting treatment as Demolisher's growth hook in removePerkInstance().
   growXMultPerk("skipper", SKIPPER_MULT_STEP);
+}
+
+// Declines every offered card - the pack was still bought (money and the
+// shop slot are already spent), this just means walking away with no
+// category bonus (or rule) from it.
+function skipPackOffer() {
+  if (!state.pendingPackOffer) return;
+  grantSkipGrowth();
   state.pendingPackOffer = null;
   state.pendingPackKind = null;
   state.pendingPackBoostedKeys = [];
@@ -6706,6 +8235,32 @@ function pickPackCard(key) {
   saveState();
 }
 
+// Which "resume" callback the shared minimize banner currently points at -
+// null whenever nothing is minimized. Originally this banner only ever
+// covered Card/Rule/Perk/Blessing Pack offers (see minimizePackOffer()); now
+// also shared by The Edict's mandatory sacrifice picker
+// (minimizeEdictPicker()) and the level-up "Choose a Perk" step
+// (showLevelCompleteModal()'s own minimizeLevelUpChoice()) - all three are
+// mutually exclusive in practice (none of them can ever be pending at the
+// same moment as another), so one shared banner/resume-slot covers all of
+// them without needing separate DOM elements or per-kind dispatch logic.
+let minimizedModalResume = null;
+
+// Shows the shared banner with the given label, remembering resumeFn as
+// what a click on it should do. Every specific minimizeX() function below
+// is just this plus its own hideModal() and label text.
+function showMinimizedBanner(label, resumeFn) {
+  packOfferBanner.textContent = label;
+  packOfferBanner.classList.remove("hidden");
+  minimizedModalResume = resumeFn;
+}
+
+packOfferBanner.addEventListener("click", () => {
+  const resumeFn = minimizedModalResume;
+  minimizedModalResume = null;
+  if (resumeFn) resumeFn();
+});
+
 // Collapses an open Card Pack offer into .pack-offer-banner instead of
 // resolving it - state.pendingPackOffer is untouched, so the offer is still
 // fully pending underneath (still blocks Refresh/buying another pack/
@@ -6723,9 +8278,9 @@ function minimizePackOffer() {
   let label;
   if (state.pendingPackKind === "rule") label = "📦 Choose a Rule - tap to resume";
   else if (state.pendingPackKind === "perk") label = "📦 Choose a Perk - tap to resume";
+  else if (state.pendingPackKind === "blessing") label = "📦 Blessing - tap to resume";
   else label = "📦 Choose a Card - tap to resume";
-  packOfferBanner.textContent = label;
-  packOfferBanner.classList.remove("hidden");
+  showMinimizedBanner(label, resumePackOffer);
 }
 
 // Brings a minimized offer back - hides the banner and re-opens the same
@@ -6734,20 +8289,41 @@ function minimizePackOffer() {
 // normal re-render, not a special "restore" path).
 function resumePackOffer() {
   packOfferBanner.classList.add("hidden");
+  minimizedModalResume = null;
   showPackOfferModal();
 }
-packOfferBanner.addEventListener("click", resumePackOffer);
 
-// Small "-" button pinned to the top-right corner of an open Card Pack
-// popup (see .pack-minimize-btn) - shared by both showPackOfferModal() and
-// renderRuleOfferModal() rather than duplicated in each.
-function createPackMinimizeBtn() {
+// The Edict's mandatory sacrifice picker (see renderEdictPicker()) has no
+// Skip/cancel - minimizing just lets the player check their owned perks/
+// rule cards/stats before deciding, it doesn't let them skip the choice
+// itself. rollDice() already re-checks !state.edictSacrificeResolved and
+// forces this same picker back open the instant a throw is attempted (see
+// its own comment there), so a minimized-and-forgotten sacrifice can never
+// actually be rolled past.
+function minimizeEdictPicker() {
+  hideModal();
+  showMinimizedBanner("⚔️ The Edict Demands a Sacrifice - tap to resume", resumeEdictPicker);
+}
+
+function resumeEdictPicker() {
+  packOfferBanner.classList.add("hidden");
+  minimizedModalResume = null;
+  renderEdictPicker();
+}
+
+// Small "-" button pinned to the top-right corner of a modal (see
+// .pack-minimize-btn) - shared by every minimizable popup (Card/Rule/Perk
+// Pack offers, The Edict's sacrifice picker, the level-up "Choose a Perk"
+// step) rather than duplicated in each. onMinimize defaults to
+// minimizePackOffer, the original (and still most common) caller; other
+// callers pass their own.
+function createPackMinimizeBtn(onMinimize = minimizePackOffer) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "pack-minimize-btn";
   btn.title = "Minimize";
   btn.textContent = "–";
-  btn.addEventListener("click", minimizePackOffer);
+  btn.addEventListener("click", onMinimize);
   return btn;
 }
 
@@ -6779,6 +8355,10 @@ function showPackOfferModal() {
   }
   if (state.pendingPackKind === "perk") {
     renderPerkOfferModal();
+    return;
+  }
+  if (state.pendingPackKind === "blessing") {
+    renderBlessingOfferModal();
     return;
   }
 
@@ -6920,14 +8500,17 @@ function renderRuleOfferModal() {
   // player-CHOSEN removal instead (the player picks exactly which card to
   // lose, same as The Edict's own mandatory sacrifice - see
   // isEdictDestroyablePerk()) - a shield never protects against that, so it
-  // keeps the full, unfiltered scope here.
-  const hasCleanSlateTarget = state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded);
-  const hasSelectiveCutTarget = state.perksOwned.some(isSlotOccupyingPerk);
+  // keeps the full scope here otherwise. Shiny perks are excluded from all
+  // three regardless - see DESTRUCTIVE_RULE_IDS's own comment - a shield
+  // only ever mattered for the random pair above; Shiny is the one
+  // protection Selective Cut's deliberate pick can't get around either.
+  const hasCleanSlateTarget = state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded && !p.shiny);
+  const hasSelectiveCutTarget = state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shiny);
   // isSlotOccupyingPerk, not a bare !p.persistent check, for the same reason
   // as Clean Slate's own removableIndices above - an owned Extra Perk copy
   // never renders its own card, so it can't be part of "how many perks are
   // even eligible to be randomly destroyed" here either.
-  const removableForShiny = state.perksOwned.filter((p) => isSlotOccupyingPerk(p) && !p.shielded).length;
+  const removableForShiny = state.perksOwned.filter((p) => isSlotOccupyingPerk(p) && !p.shielded && !p.shiny).length;
 
   state.pendingPackOffer.forEach((ruleId) => {
     const rule = RULE_POOL.find((r) => r.id === ruleId);
@@ -6990,12 +8573,13 @@ function renderRuleOfferModal() {
         // comment), the same targets stay locked in - otherwise any of those
         // was a free "keep rerolling until I like the preview" button.
         if (ruleId === "oooShiny" && oooShinyRemovedPerks.length === 0) {
-          // Shielded perks are never a random destroy target - they still
-          // count as survivors eligible to be picked shiny below, though.
+          // Shielded AND Shiny perks are never a random destroy target -
+          // they still count as survivors eligible to be picked shiny
+          // below, though (see the picker loop's own comment further down).
           // isSlotOccupyingPerk (not a bare !p.persistent check) also keeps
           // an owned Extra Perk copy out of this pool - same reasoning as
           // removableForShiny's own comment above.
-          const removable = state.perksOwned.filter((p) => isSlotOccupyingPerk(p) && !p.shielded);
+          const removable = state.perksOwned.filter((p) => isSlotOccupyingPerk(p) && !p.shielded && !p.shiny);
           const removeCount = oooShinyRemovalCount(removable.length);
           const shuffled = [...removable];
           for (let i = shuffled.length - 1; i > 0; i--) {
@@ -7013,18 +8597,30 @@ function renderRuleOfferModal() {
         // Selective Cut is a deliberate pick (shielded perks stay eligible -
         // see hasSelectiveCutTarget's own comment above); Ooo Shiny is the
         // only OTHER needsPerkSelection rule reaching here, and its own
-        // isDisabled check above already guarantees a non-shielded target
-        // exists whenever this is reachable, so excluding shielded here too
-        // costs nothing and stays consistent with its random-pool scope.
+        // isDisabled check above already guarantees a non-shielded,
+        // non-Shiny target exists whenever this is reachable, so excluding
+        // shielded/Shiny here too costs nothing and stays consistent with
+        // its random-pool scope. Shiny is excluded from Selective Cut's own
+        // branch too - see DESTRUCTIVE_RULE_IDS's own comment.
         const hasRemovablePerk = ruleId === "oooShiny"
-          ? state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded)
-          : state.perksOwned.some(isSlotOccupyingPerk);
+          ? state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded && !p.shiny)
+          : state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shiny);
         if (rule.needsPerkSelection && hasRemovablePerk) {
           renderRuleOfferModal();
         } else {
           confirmRuleSelection();
         }
       });
+    }
+    // Clean Slate's payout scales with how many perk cards are currently
+    // owned (see its own apply()) - showing the real number right on the
+    // offer card, always as the last line, means the player never has to do
+    // that math themselves before deciding whether it's worth taking.
+    if (ruleId === "cleanSlate") {
+      const currentPayout = document.createElement("div");
+      currentPayout.className = "pack-card-rule-desc pack-card-rule-current-payout";
+      currentPayout.textContent = `Current +$${20 * state.perksOwned.filter(isSlotOccupyingPerk).length}`;
+      card.appendChild(currentPayout);
     }
     cardsWrap.appendChild(card);
   });
@@ -7037,10 +8633,11 @@ function renderRuleOfferModal() {
   // aren't valid targets - isSlotOccupyingPerk excludes both, it only offers
   // actual owned perks to remove. Same shielded-exclusion split as the click
   // handler above (Selective Cut's deliberate pick stays eligible; Ooo
-  // Shiny's random pool doesn't).
+  // Shiny's random pool doesn't) - Shiny is excluded from both regardless
+  // (see DESTRUCTIVE_RULE_IDS's own comment).
   const hasRemovablePerk = selectedRule?.id === "oooShiny"
-    ? state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded)
-    : state.perksOwned.some(isSlotOccupyingPerk);
+    ? state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shielded && !p.shiny)
+    : state.perksOwned.some((p) => isSlotOccupyingPerk(p) && !p.shiny);
   const needsPerkPick = !!(selectedRule && selectedRule.needsPerkSelection && hasRemovablePerk);
   // Only while the perk-to-remove picker below is actually showing - that's
   // the one part of this modal whose length tracks the player's whole
@@ -7064,6 +8661,13 @@ function renderRuleOfferModal() {
       // removableForShiny's own comment above).
       if (!isSlotOccupyingPerk(perk)) return;
       if (selectedRule.id === "oooShiny" && oooShinyRemovedPerks.includes(perk)) return;
+      // Selective Cut can't target a Shiny perk any more than Clean
+      // Slate/Ooo Shiny's random pools can (see DESTRUCTIVE_RULE_IDS's own
+      // comment) - excluded here so it never even appears as an option.
+      // Ooo Shiny's OWN use of this same list is unaffected - it's picking
+      // a SURVIVOR to make shiny, not a destroy target, so an already-Shiny
+      // perk stays a perfectly normal (if redundant) option there.
+      if (selectedRule.id === "selectiveCut" && perk.shiny) return;
       // A shielded perk stays fully listed here either way: for Selective
       // Cut it's a valid (deliberate) destroy target same as any other perk
       // (see hasSelectiveCutTarget's own comment above), and for Ooo Shiny
@@ -7144,8 +8748,10 @@ function renderPerkOfferModal() {
   // Fixed at the top of every render (nothing changes it mid-modal, same as
   // showLevelCompleteModal()'s own isFullAtOpen) - whether taking ANY
   // offered card (other than Extra Perk/a shiny copy, neither of which ever
-  // need a slot) would need to bump an existing one first.
-  const visibleCount = state.perksOwned.filter(isSlotOccupyingPerk).length;
+  // need a slot) would need to bump an existing one first. isNormalSlotPerk,
+  // not isSlotOccupyingPerk - a Shiny perk's own slot lives entirely outside
+  // this cap now (see effectivePerkSlotCount()'s own comment).
+  const visibleCount = state.perksOwned.filter(isNormalSlotPerk).length;
   const slotsFull = visibleCount >= effectivePerkSlotCount();
 
   state.pendingPackOffer.forEach((perkId) => {
@@ -7200,25 +8806,39 @@ function renderPerkOfferModal() {
 
     const picker = document.createElement("div");
     picker.className = "rule-perk-picker";
-    // Shiny copies included on purpose (isSlotOccupyingPerk, not
-    // isNormalSlotPerk) - same reasoning as showLevelCompleteModal()'s own
-    // renderReplaceStep(): a shiny copy's extra slot only exempts it from
-    // counting toward "is the board full", not from being tradeable once it
-    // already is.
-    state.perksOwned.forEach((owned, index) => {
-      if (!isSlotOccupyingPerk(owned)) return;
-      const opt = document.createElement("button");
-      opt.type = "button";
-      opt.className = "rule-perk-option" + (selectedPerkPackReplaceIndex === index ? " selected" : "");
-      if (owned.shiny) decorateShiny(opt);
-      opt.textContent = owned.name + perkXMultTag(owned);
-      if (owned.shielded) decorateShielded(opt);
-      opt.addEventListener("click", () => {
-        selectedPerkPackReplaceIndex = index;
-        confirmPerkPackPick(chosenPerk, index);
+    // isNormalSlotPerk, not isSlotOccupyingPerk - a Shiny copy's own slot
+    // lives entirely outside the normal cap (see effectivePerkSlotCount()'s
+    // own comment), so trading one away would never actually free up room
+    // for the new (non-Shiny) pick; it's excluded from this replace list
+    // for the same reason it never counted toward "is the board full"
+    // above. Listed in slot order (see perkSlotPositionMap()), not
+    // state.perksOwned's own array order - the click handler below still
+    // needs each option's REAL perksOwned index (that's what
+    // confirmPerkPackPick() actually splices), so the index has to be
+    // captured up front and carried alongside the perk through the sort,
+    // rather than reading it back out from a reordered forEach.
+    const slotPosition = perkSlotPositionMap();
+    state.perksOwned
+      .map((owned, index) => ({ owned, index }))
+      .filter(({ owned }) => isNormalSlotPerk(owned))
+      .sort((a, b) => {
+        const posA = slotPosition.has(a.owned.instanceId) ? slotPosition.get(a.owned.instanceId) : Infinity;
+        const posB = slotPosition.has(b.owned.instanceId) ? slotPosition.get(b.owned.instanceId) : Infinity;
+        return posA - posB;
+      })
+      .forEach(({ owned, index }) => {
+        const opt = document.createElement("button");
+        opt.type = "button";
+        opt.className = "rule-perk-option" + (selectedPerkPackReplaceIndex === index ? " selected" : "");
+        if (owned.shiny) decorateShiny(opt);
+        opt.textContent = owned.name + perkXMultTag(owned);
+        if (owned.shielded) decorateShielded(opt);
+        opt.addEventListener("click", () => {
+          selectedPerkPackReplaceIndex = index;
+          confirmPerkPackPick(chosenPerk, index);
+        });
+        picker.appendChild(opt);
       });
-      picker.appendChild(opt);
-    });
     modalBox.appendChild(picker);
   }
 
@@ -7260,6 +8880,109 @@ function confirmPerkPackPick(perk, replaceIndex) {
   selectedPerkPackReplaceIndex = null;
   hideModal();
   flushPendingGoldenTouchCue();
+  renderPackShop();
+  renderAll();
+  saveState();
+}
+
+// Blessing's own pack-offer render (see activateUsable()'s "blessing"
+// branch and showPackOfferModal()) - a flat list of state.pendingPackOffer's
+// cards (2 or 3, or none while BLESSING_POOL is still empty), same
+// pack-card-large template the perk offer above uses, minus the
+// perk-slot-full replace picker (Blessing doesn't need one - see
+// pickBlessingCard()). Resolved by pickBlessingCard()/skipBlessingOffer()
+// below, not pickPackCard()/confirmPerkPackPick() - those don't know about
+// pendingBlessingInstanceId, the usablesOwned instance that opened this
+// offer and still needs freeing once it resolves.
+function renderBlessingOfferModal() {
+  const flipIn = pendingPackFlipIn;
+  pendingPackFlipIn = false;
+
+  modalBox.innerHTML = "";
+  modalBox.classList.add("pack-modal");
+  modalBox.appendChild(createPackMinimizeBtn());
+
+  const h2 = document.createElement("h2");
+  h2.textContent = "Blessing";
+
+  const cardsWrap = document.createElement("div");
+  cardsWrap.className = "pack-modal-cards";
+
+  state.pendingPackOffer.forEach((blessingId) => {
+    const blessing = BLESSING_POOL.find((b) => b.id === blessingId);
+    if (!blessing) return;
+    const card = document.createElement("div");
+    card.className = "pack-card pack-card-large blessing-card"
+      + (blessing.tintClass ? ` ${blessing.tintClass}` : "")
+      + (flipIn ? " pack-card-flip-in" : "");
+    if (flipIn) clearFlipInOnAnimationEnd(card);
+    attachCardTilt(card);
+
+    const name = document.createElement("div");
+    name.className = "pack-card-name";
+    name.textContent = blessing.name;
+
+    const desc = document.createElement("div");
+    desc.className = "pack-card-rule-desc";
+    desc.textContent = blessing.desc;
+
+    card.appendChild(name);
+    card.appendChild(desc);
+    card.addEventListener("click", () => pickBlessingCard(blessing));
+    cardsWrap.appendChild(card);
+  });
+
+  modalBox.appendChild(h2);
+  modalBox.appendChild(cardsWrap);
+
+  const skipBtnEl = document.createElement("button");
+  skipBtnEl.className = "modal-btn pack-skip-btn";
+  skipBtnEl.textContent = "Skip";
+  skipBtnEl.addEventListener("click", skipBlessingOffer);
+
+  const btnRow = document.createElement("div");
+  btnRow.className = "modal-btn-row";
+  btnRow.appendChild(skipBtnEl);
+  modalBox.appendChild(btnRow);
+
+  modalOverlay.classList.remove("hidden");
+  modalBox.focus();
+}
+
+// Resolves a chosen Blessing card - runs its own apply(state) hook, once
+// BLESSING_POOL actually has entries that carry one (a no-op today, the pool
+// is still empty), then shares the same cleanup skipBlessingOffer() uses.
+function pickBlessingCard(blessing) {
+  // Pushed into state.usablesOwned, same plain {id, instanceId} shape every
+  // other usable uses - shows up in the Usables sidebar and is activated
+  // the same way (click it, see usableActivatable()/activateUsable()),
+  // rather than taking effect immediately on pick.
+  state.usablesOwned.push({ id: blessing.id, instanceId: state.nextUsableInstanceId++ });
+  resolveBlessingOffer();
+}
+
+function skipBlessingOffer() {
+  // A Blessing Pack offer is still a pack offer being skipped - see
+  // grantSkipGrowth()'s own comment.
+  grantSkipGrowth();
+  resolveBlessingOffer();
+}
+
+// Shared cleanup for both ways a Blessing offer can end - tears down the
+// same pendingPack* fields every other pack kind resets on resolve, and,
+// unlike those, also removes the specific usablesOwned instance that opened
+// it (see activateUsable()'s "blessing" branch, which deliberately leaves it
+// owned/unspent until now - a Blessing bought but never activated, or
+// minimized and left alone, should stay owned and reopenable).
+function resolveBlessingOffer() {
+  const instanceIndex = state.usablesOwned.findIndex((u) => u.instanceId === state.pendingBlessingInstanceId);
+  if (instanceIndex !== -1) state.usablesOwned.splice(instanceIndex, 1);
+  state.pendingBlessingInstanceId = null;
+  state.pendingPackOffer = null;
+  state.pendingPackKind = null;
+  state.pendingPackShinyKeys = [];
+  state.pendingPackIsMega = false;
+  hideModal();
   renderPackShop();
   renderAll();
   saveState();
@@ -7472,6 +9195,30 @@ function buyBossUsable() {
   const item = USABLE_POOL.find((u) => u.id === state.bossUsableOffer);
   if (!item || state.money < item.cost) return;
   state.money -= item.cost;
+  state.bossUsableOffer = null;
+  if (item.id === "blessing2" || item.id === "blessing3") {
+    // Opens the picker immediately on purchase instead of depositing an
+    // unopened pack into usablesOwned that would need a separate later
+    // click to activate - same offer state activateUsable()'s own
+    // "blessing2"/"blessing3" branch sets up, just triggered straight from
+    // the buy instead of from a 2nd click on an owned pack. No usablesOwned
+    // instance ever exists for the pack itself, so pendingBlessingInstanceId
+    // stays null (same as the debug Blessing button's own flow) -
+    // resolveBlessingOffer() already treats that as "nothing to free".
+    // usablesPurchasedIds is skipped below regardless (Blessing is
+    // repeatable), so no special-casing needed for that part.
+    state.pendingBlessingInstanceId = null;
+    state.pendingPackKind = "blessing";
+    state.pendingPackOffer = sampleBlessingIds(item.cardCount);
+    state.pendingPackBoostedKeys = [];
+    state.pendingPackShinyKeys = [];
+    state.pendingPackIsMega = false;
+    pendingPackFlipIn = true;
+    renderAll();
+    showPackOfferModal();
+    saveState();
+    return;
+  }
   const instance = { id: item.id, instanceId: state.nextUsableInstanceId++ };
   // Multi-charge items (Free Reroll Token) seed their own remaining-uses
   // counter from the pool entry's starting value - see activateUsable().
@@ -7481,9 +9228,9 @@ function buyBossUsable() {
   // Each usable can only ever be bought once per run - permanently excludes
   // this id from every future roll (see pickRandomUsableId()), regardless
   // of whether/when this particular instance later gets fully spent and
-  // removed from usablesOwned.
-  if (!state.usablesPurchasedIds.includes(item.id)) state.usablesPurchasedIds.push(item.id);
-  state.bossUsableOffer = null;
+  // removed from usablesOwned. Blessing is the one exception (item.repeatable
+  // - see USABLE_POOL) - never added here, so it stays eligible forever.
+  if (!item.repeatable && !state.usablesPurchasedIds.includes(item.id)) state.usablesPurchasedIds.push(item.id);
   renderAll();
   saveState();
 }
@@ -7677,7 +9424,9 @@ function startNextLevel() {
       return false; // matured - remove it
     });
 
-    // The main game that just finished is one of Make it count's 3 games.
+    // Make it Count only counts down on a Boss clearing, never a small
+    // game (see tickMakeItCount()'s own comment) - the main game that just
+    // finished is one of its 2.
     tickMakeItCount();
 
     // Compound Interest pays out once every boss (main game) cleared, not
@@ -7697,6 +9446,14 @@ function startNextLevel() {
     if (state.thirdTimesCharmPendingBossLock) {
       state.thirdTimesCharmLocksRemaining = 2;
       state.thirdTimesCharmPendingBossLock = false;
+    }
+    // Fire Sale: same "the boss that just concluded is the one its own
+    // trigger was waiting for" reasoning as Third Time's the Charm just
+    // above - if Fire Sale vanished (this pair's shops, or one even
+    // further back) before this boss, queue up its own 2 locked shops too.
+    if (state.fireSalePendingBossLock) {
+      state.fireSaleLocksRemaining = 2;
+      state.fireSalePendingBossLock = false;
     }
   }
 
@@ -7719,7 +9476,15 @@ function startNextLevel() {
     scoreMultiplier: state.scoreMultiplier,
     bonusPoints: state.bonusPoints,
     smallGameTurnLimit: state.smallGameTurnLimit,
-    perksOwned: state.perksOwned,
+    // Blessing of The Censor's own duplicate (see
+    // duplicateEligiblePerkForBlessingCensor()) only ever lasts the round
+    // it was created in - it can only ever exist while state.phase is
+    // "main" (a Blessing is only ever activatable then), and every
+    // transition away from "main" always goes to "small1" next (never
+    // straight to another "main"), so dropping it here unconditionally
+    // is always exactly "the instant this round ends", never a no-op that
+    // accidentally strips one still mid-round.
+    perksOwned: state.perksOwned.filter((p) => !p.blessingCensorDuplicate),
     perkSlotOrder: state.perkSlotOrder,
     nextPerkInstanceId: state.nextPerkInstanceId,
     usablesOwned: state.usablesOwned,
@@ -7744,6 +9509,10 @@ function startNextLevel() {
     // transitions too (showNextRoundPrompt() is what actually consumes it).
     thirdTimesCharmPendingBossLock: state.thirdTimesCharmPendingBossLock,
     thirdTimesCharmLocksRemaining: state.thirdTimesCharmLocksRemaining,
+    // Fire Sale: same undisturbed-across-the-rebuild reasoning as Third
+    // Time's the Charm's own pair just above.
+    fireSalePendingBossLock: state.fireSalePendingBossLock,
+    fireSaleLocksRemaining: state.fireSaleLocksRemaining,
     // Bank the game/level that just finished now, at the transition point -
     // not in endLevel(), which runs while the old scorecard (and its score)
     // is still live, which would double-count it against completedLevelsTotal.
@@ -7770,6 +9539,20 @@ function startNextLevel() {
   if (MAIN_GAME_MODIFIERS[mainGameModifierIndex]?.id === "theThief") {
     diceCountForNewLevel = Math.max(1, diceCountForNewLevel - 1); // a fresh level with The Thief - steal one
   }
+  // Blessing of The Thief: only the "leaving a main level" half of the real
+  // Thief's own give/steal pair applies here - the "entering" grant instead
+  // happens live at activation time (see activateUsable()), since a
+  // Blessing can only ever be activated once a Boss is already in
+  // progress, never at the exact instant it begins. This half is still
+  // needed as a safety net: if the blessing was activated (and its die
+  // granted) partway through the level that's now ending, it must be given
+  // back here or the bonus would silently carry into the next level.
+  // state.activeBlessings hasn't been reset yet at this point (state is
+  // still the OLD one, about to be discarded below), so this correctly
+  // reads whether it was active for the level that just ended.
+  if (state.phase === "main" && hasBlessing("blessing_theThief")) {
+    diceCountForNewLevel -= 1;
+  }
   state = newRunState(diceCountForNewLevel);
   Object.assign(state, carry);
   // The Censor: a fresh main level with this boss always starts with
@@ -7782,6 +9565,15 @@ function startNextLevel() {
   // count a Hotline/All Luck copy that's about to be silenced as still
   // active, banking one extra doubleTargets entry that wouldn't self-correct
   // until the level's first hand was actually committed.
+  //
+  // No Blessing has an equivalent initial call here on purpose -
+  // state.activeBlessings was just reset to [] by newRunState() above, and
+  // nothing can have been activated yet this early (a Blessing is only
+  // ever activatable once state.phase is already "main" - see
+  // usableActivatable()), so there's nothing yet for any of them to do.
+  // Each one's own one-time setup (Censor's duplicate, Culler's removal,
+  // Gatekeeper's first boosted categories) instead happens right at
+  // activation time - see activateUsable().
   if (activeBossModifier()?.id === "theCensor") pickNewCensorTarget();
   rerollDoubleTarget();
   // The Void: unlike the other per-level boss setup here, its blocked face
@@ -7887,25 +9679,33 @@ function showLevelCompleteModal(total) {
   state.gameOver = true;
   renderControls();
 
-  // When perk slots are full, Extra Perk is guaranteed to be one of the 3 -
-  // it's the one pick that never requires trashing anything, so the player
-  // always has a way to gain a perk without giving one up. Fullness is
-  // fixed at modal-open time (nothing changes it mid-modal), so it's safe
-  // to compute once and reuse for every reroll too.
-  const visibleCountAtOpen = state.perksOwned.filter(isSlotOccupyingPerk).length;
+  // When perk slots are full, Extra Perk has EXTRA_PERK_GUARANTEE_CHANCE's
+  // own chance of being forced into the 3 - it's the one pick that never
+  // requires trashing anything, so a full board isn't always left with no
+  // way out, but isn't always handed a free one either. Fullness is fixed
+  // at modal-open time (nothing changes it mid-modal), so it's safe to
+  // compute once and reuse for every reroll too. isNormalSlotPerk, not
+  // isSlotOccupyingPerk - a Shiny perk's own slot lives entirely outside
+  // this cap now (see effectivePerkSlotCount()'s own comment).
+  const visibleCountAtOpen = state.perksOwned.filter(isNormalSlotPerk).length;
   const isFullAtOpen = visibleCountAtOpen >= effectivePerkSlotCount();
 
   function rollOptions() {
     const sampled = samplePerks(state, 3);
-    if (isFullAtOpen && !sampled.some((p) => p.id === "extraPerkSlot")) {
+    if (isFullAtOpen && !sampled.some((p) => p.id === "extraPerkSlot") && Math.random() < EXTRA_PERK_GUARANTEE_CHANCE) {
       sampled[Math.floor(Math.random() * sampled.length)] = PERK_POOL.find((p) => p.id === "extraPerkSlot");
     }
-    // Each offered card independently has a small chance of being shiny.
-    // Wrapped in a shallow copy (not mutating the canonical PERK_POOL
-    // entry, which is shared/reused everywhere) - applyAndAdvance() spreads
-    // this same object into the owned instance, so the flag carries through
+    // Each offered card independently has a small chance of being shiny -
+    // except Extra Perk, which never renders its own card (see
+    // isSlotOccupyingPerk) and so has nothing for Shiny to visibly decorate
+    // or affect (its own slot-capacity bump is flat either way). Wrapped in
+    // a shallow copy (not mutating the canonical PERK_POOL entry, which is
+    // shared/reused everywhere) - applyAndAdvance() spreads this same
+    // object into the owned instance, so the flag carries through
     // automatically if picked.
-    return sampled.map((perk) => (Math.random() < effectiveShinyChance() ? { ...perk, shiny: true } : perk));
+    return sampled.map((perk) => (
+      perk.id !== "extraPerkSlot" && Math.random() < effectiveShinyChance() ? { ...perk, shiny: true } : perk
+    ));
   }
 
   // Not const - re-rolling (see renderChoiceStep) replaces this with a
@@ -7993,13 +9793,16 @@ function showLevelCompleteModal(total) {
   }
 
   function choosePerk(perk, cardEl) {
-    const visibleCount = state.perksOwned.filter(isSlotOccupyingPerk).length;
+    // isNormalSlotPerk, not isSlotOccupyingPerk - a Shiny perk's own slot
+    // lives entirely outside this cap now (see effectivePerkSlotCount()'s
+    // own comment).
+    const visibleCount = state.perksOwned.filter(isNormalSlotPerk).length;
     const full = visibleCount >= effectivePerkSlotCount();
     // Extra Perk always fits - it's what makes room for the next pick, so
     // it never needs to bump anything to be taken. A shiny pick always
-    // fits too, for the same reason: it brings its own extra slot (see
-    // effectivePerkSlotCount()'s shinyCopies) rather than occupying one of
-    // the existing ones, so "slots full" can never actually be true for it.
+    // fits too, for the same reason: it brings its own separate slot (see
+    // isSeparateShinySlot()) rather than occupying one of the normal ones,
+    // so "slots full" can never actually be true for it.
     if (perk.id === "extraPerkSlot" || perk.shiny || !full) {
       // Block further picks/reroll/skip mid-animation - the cards
       // themselves get their own pointer-events:none once faded (see
@@ -8011,10 +9814,45 @@ function showLevelCompleteModal(total) {
     }
   }
 
+  // Minimizing here just lets the player check their owned perks/rule
+  // cards/stats before picking - it doesn't skip the choice itself.
+  // rollBtn stays disabled the whole time this is minimized (see
+  // renderControls()'s own state.gameOver check, set at the top of this
+  // function and only ever cleared once a pick or Skip actually resolves
+  // it), so a minimized-and-forgotten choice can never be rolled/advanced
+  // past without resolving it first - same defense-in-depth precedent as
+  // minimizeEdictPicker()'s own comment. Defined inside this closure (not a
+  // standalone top-level function like minimizeEdictPicker()) specifically
+  // so its resume calls THIS render's own renderChoiceStep() - reusing the
+  // exact same `options` this modal already rolled, rather than rerolling a
+  // fresh 3 cards from scratch.
+  function minimizeLevelUpChoice() {
+    hideModal();
+    showMinimizedBanner("🎁 Choose a Perk - tap to resume", () => {
+      packOfferBanner.classList.add("hidden");
+      minimizedModalResume = null;
+      renderChoiceStep();
+      // renderChoiceStep() itself doesn't touch modalOverlay or move focus
+      // (see its own re-use on Reroll, which needs neither since the
+      // overlay's already showing and focus already sits on modalBox by
+      // then) - it relies on this function's initial call, further down,
+      // having already done so. hideModal() (see minimizeLevelUpChoice()
+      // above) hid modalOverlay again and dropped focus, so both have to be
+      // redone here on resume - the overlay so the popup is actually
+      // visible again at all, and the focus move for the same stray-Enter-
+      // on-a-disabled-background-button concern as renderEdictPicker()'s
+      // own unconditional modalBox.focus() at the end of every one of its
+      // calls (see its comment there).
+      modalOverlay.classList.remove("hidden");
+      modalBox.focus();
+    });
+  }
+
   function renderChoiceStep() {
     modalBox.innerHTML = "";
     modalBox.classList.add("perk-choice-modal");
     modalBox.classList.remove("modal-scrollable"); // in case "Back" brought us here from renderReplaceStep()'s own scrollable list
+    modalBox.appendChild(createPackMinimizeBtn(minimizeLevelUpChoice));
     const h2 = document.createElement("h2");
     h2.textContent = `${currentStageName} Complete!`;
     const p = document.createElement("p");
@@ -8062,15 +9900,32 @@ function showLevelCompleteModal(total) {
     const skipBtnEl = document.createElement("button");
     skipBtnEl.className = "modal-btn pack-skip-btn";
     skipBtnEl.textContent = "Skip";
-    skipBtnEl.addEventListener("click", () => startNextLevel());
+    // grantSkipGrowth() - this "Skip" walks away from a perk offer same as
+    // any Card/Rule/Perk/Blessing Pack's own Skip does, so it earns the
+    // exact same Lucky Skip/Skipper growth those already do (see
+    // grantSkipGrowth()'s own comment for why this is a shared call).
+    skipBtnEl.addEventListener("click", () => {
+      grantSkipGrowth();
+      startNextLevel();
+    });
+
+    // Same shared-size/gap row every other Confirm-or-Skip button pair in
+    // this file uses (see .modal-btn-row in style.css) - previously each
+    // button was just appended straight to modalBox with its own
+    // margin-top, stacking one above the other at two different sizes
+    // (Reroll's own .refresh-pack-btn padding/font-size vs Skip's
+    // .modal-btn) instead of sitting side by side, evenly matched.
+    const btnRow = document.createElement("div");
+    btnRow.className = "modal-btn-row";
+    btnRow.appendChild(rerollBtnEl);
+    btnRow.appendChild(skipBtnEl);
 
     modalBox.appendChild(h2);
     modalBox.appendChild(p);
     const ownedSummary = buildOwnedPerksSummary();
     if (ownedSummary) modalBox.appendChild(ownedSummary);
     modalBox.appendChild(optWrap);
-    modalBox.appendChild(rerollBtnEl);
-    modalBox.appendChild(skipBtnEl);
+    modalBox.appendChild(btnRow);
   }
 
   // Perk slots are full and this pick isn't Extra Perk - let the player
@@ -8096,14 +9951,12 @@ function showLevelCompleteModal(total) {
     const optWrap = document.createElement("div");
     optWrap.className = "perk-options";
 
-    // Shiny copies are deliberately included here (isSlotOccupyingPerk, not
-    // isNormalSlotPerk) - a shiny copy's extra slot only exempts it from
-    // COUNTING toward "is the board full", not from being a valid trade-away
-    // candidate once it already is. Excluding it entirely would hide it from
-    // this decision altogether, with no other way to tell it apart from an
-    // identical non-shiny copy sitting right next to it.
-    state.perksOwned
-      .filter(isSlotOccupyingPerk)
+    // isNormalSlotPerk, not isSlotOccupyingPerk - a Shiny copy's own slot
+    // lives entirely outside the normal cap (see effectivePerkSlotCount()'s
+    // own comment), so trading one away would never actually free up room
+    // for the new pick; it's excluded from this replace list for the same
+    // reason it never counted toward "is the board full" above.
+    perksInSlotOrder(state.perksOwned.filter(isNormalSlotPerk))
       .forEach((owned) => {
         const btn = document.createElement("button");
         btn.className = "perk-option" + (owned.tint ? ` tint-${owned.tint}` : "");
@@ -8128,7 +9981,14 @@ function showLevelCompleteModal(total) {
     const skipBtnEl = document.createElement("button");
     skipBtnEl.className = "modal-btn pack-skip-btn";
     skipBtnEl.textContent = "Skip";
-    skipBtnEl.addEventListener("click", () => startNextLevel());
+    // grantSkipGrowth() - this "Skip" walks away from a perk offer same as
+    // any Card/Rule/Perk/Blessing Pack's own Skip does, so it earns the
+    // exact same Lucky Skip/Skipper growth those already do (see
+    // grantSkipGrowth()'s own comment for why this is a shared call).
+    skipBtnEl.addEventListener("click", () => {
+      grantSkipGrowth();
+      startNextLevel();
+    });
 
     modalBox.appendChild(h2);
     modalBox.appendChild(p);
@@ -8208,12 +10068,15 @@ function showLevelCompleteModal(total) {
 }
 
 // The Edict's mandatory pre-throw choice - which eligible owned perk to
-// silence for the entire level. No skip/cancel button and no backdrop
-// close handler (modalOverlay has none of its own - see showPackOfferModal
-// etc.), so the only way out is actually picking one.
+// silence for the entire level. No skip/cancel button and no backdrop close
+// handler (modalOverlay has none of its own - see showPackOfferModal etc.),
+// so the only way to actually resolve it is picking one - the minimize
+// button just lets the player check other panels first (see
+// minimizeEdictPicker()'s own comment), it doesn't offer a way around it.
 function renderEdictPicker() {
   modalBox.innerHTML = "";
   modalBox.classList.add("perk-choice-modal");
+  modalBox.appendChild(createPackMinimizeBtn(minimizeEdictPicker));
 
   const h2 = document.createElement("h2");
   h2.textContent = "The Edict Demands a Sacrifice";
@@ -8230,7 +10093,7 @@ function renderEdictPicker() {
   // already used for a voluntary trash, so nothing needs to be excluded on
   // that front. See isEdictDestroyablePerk() for the one thing that is
   // still left out (Extra Perk).
-  state.perksOwned.filter(isEdictDestroyablePerk).forEach((perk) => {
+  perksInSlotOrder(state.perksOwned.filter(isEdictDestroyablePerk)).forEach((perk) => {
     const card = document.createElement("div");
     card.className = "pack-card pack-card-large perk-choice-card" + (perk.tint ? ` tint-${perk.tint}` : "");
     attachCardTilt(card);
@@ -8263,7 +10126,7 @@ function renderEdictPicker() {
     if (typeof perk.xMult !== "undefined") {
       const multBadge = document.createElement("div");
       multBadge.className = "perk-card-xmult-badge";
-      multBadge.textContent = `+${resolveXMult(perk, state)}x`;
+      multBadge.textContent = xMultBadgeText(perk, state);
       card.appendChild(multBadge);
     }
     card.addEventListener("click", () => {
@@ -8394,6 +10257,233 @@ function renderVoidRollModal() {
   modalBox.focus();
 }
 
+// Blessing of The Edict's own picker (see activateUsable()) - same
+// template/Back-button shape as Perk Reroll Token's own picker
+// (renderPerkRerollPicker()) - opened by choice, not forced, so backing out
+// leaves the token owned and unspent, same as never having clicked it.
+// Reversed from the real Edict's own mandatory destroy-picker
+// (renderEdictPicker()) into duplicating the chosen perk instead: a fresh
+// instance built straight from PERK_POOL (X-mult/growth/marked-die-index
+// reset to that card's own fresh-pick baseline, same as any other freshly
+// picked copy - "New card starts fresh"), Shiny carried over from the one
+// clicked, pushed with no stack-cap check at all ("no stack limit" - that
+// cap is only ever enforced by the offer-generation code -
+// samplePerks()/rollOptions() - a direct push here always bypasses it).
+// Tagged blessingEdictDuplicate so effectivePerkSlotCount() can grow to fit
+// it even with slots already full - the same "brings its own extra slot"
+// treatment Blessing of The Censor's own duplicate gets (see
+// duplicateEligiblePerkForBlessingCensor()), except permanent: this one is
+// never added to state.activeBlessings and never stripped at a phase
+// transition, so its slot stays for the rest of the run, matching the
+// duplicate itself being a real, independent, permanent perk instance.
+function renderBlessingEdictPicker(usableInstanceId) {
+  modalBox.innerHTML = "";
+  modalBox.classList.add("perk-choice-modal");
+
+  const h2 = document.createElement("h2");
+  h2.textContent = "Blessing of The Edict";
+  const p = document.createElement("p");
+  p.textContent = "Choose one owned perk to duplicate - a fresh copy, Shiny kept, X-mult reset, no stack limit, its own new perk slot:";
+
+  const optWrap = document.createElement("div");
+  optWrap.className = "perk-options perk-choice-options";
+
+  // "Back" (not "Cancel") - same reasoning as Perk Reroll Token's own Back
+  // button above.
+  const backBtn = document.createElement("button");
+  backBtn.type = "button";
+  backBtn.className = "modal-btn";
+  backBtn.textContent = "Back";
+  backBtn.addEventListener("click", () => {
+    hideModal();
+    renderAll();
+    rollBtn.focus();
+  });
+  const btnRow = document.createElement("div");
+  btnRow.className = "modal-btn-row";
+  btnRow.appendChild(backBtn);
+
+  perksInSlotOrder(state.perksOwned.filter(isEdictDestroyablePerk)).forEach((perk) => {
+    const card = document.createElement("div");
+    card.className = "pack-card pack-card-large perk-choice-card" + (perk.tint ? ` tint-${perk.tint}` : "");
+    attachCardTilt(card);
+    if (perk.shiny) decorateShiny(card);
+    if (perk.shielded) decorateShielded(card);
+
+    const name = document.createElement("div");
+    name.className = "pack-card-name";
+    name.textContent = perk.name;
+
+    const desc = document.createElement("div");
+    desc.className = "pack-card-rule-desc";
+    desc.textContent = perk.desc;
+
+    card.appendChild(name);
+    card.appendChild(desc);
+    if (typeof perk.xMult !== "undefined") {
+      const multBadge = document.createElement("div");
+      multBadge.className = "perk-card-xmult-badge";
+      multBadge.textContent = xMultBadgeText(perk, state);
+      card.appendChild(multBadge);
+    }
+    card.addEventListener("click", () => {
+      const def = PERK_POOL.find((p) => p.id === perk.id);
+      // instanceId stamped explicitly - the original code here never did,
+      // leaving the duplicate as the only perk instance in the game with no
+      // unique id, which perkSlotPositionMap()/drag-drop/the trash and
+      // shield pickers all key off of.
+      const instance = { ...def, shiny: !!perk.shiny, instanceId: state.nextPerkInstanceId++, blessingEdictDuplicate: true };
+      if (typeof def.apply === "function") def.apply(state, instance);
+      state.perksOwned.push(instance);
+      const usableIndex = state.usablesOwned.findIndex((u) => u.instanceId === usableInstanceId);
+      if (usableIndex !== -1) state.usablesOwned.splice(usableIndex, 1);
+      hideModal();
+      renderAll();
+      rollBtn.focus();
+      saveState();
+    });
+    optWrap.appendChild(card);
+  });
+
+  modalBox.appendChild(h2);
+  modalBox.appendChild(p);
+  modalBox.appendChild(optWrap);
+  modalBox.appendChild(btnRow);
+  modalOverlay.classList.remove("hidden");
+  modalBox.focus();
+}
+
+// Blessing of The Void's own activation-time roll (see activateUsable()) -
+// shown the instant the owned card is clicked in the Usables sidebar,
+// reusing the same standalone-die tumble as the real Void's own
+// renderVoidRollModal() above, just landing on instance.favoredFace
+// instead of state.voidBlockedFace. onDone is activateUsable()'s own
+// leftover cleanup (closing the modal, re-rendering, saving) - deferred to
+// here since that has to wait for this roll to actually finish first.
+function renderBlessingVoidRollModal(instance, onDone) {
+  modalBox.innerHTML = "";
+  modalBox.classList.add("void-roll-modal");
+
+  const h2 = document.createElement("h2");
+  h2.textContent = "Blessing of The Void";
+  const p = document.createElement("p");
+  p.textContent = "Roll one die - for the rest of this round, whatever face it lands on adds its own value to your score for every die showing it in a committed hand.";
+
+  const sceneWrap = document.createElement("div");
+  sceneWrap.className = "void-roll-die-wrap";
+  const scene = document.createElement("div");
+  scene.className = "die-scene void-roll-die";
+  const cube = document.createElement("div");
+  cube.className = "die-cube";
+  Object.entries(FACE_VALUE_BY_POSITION).forEach(([position, value]) => {
+    cube.appendChild(createDieFace(position, value));
+  });
+  cube.style.transform = "rotateX(0deg) rotateY(0deg)";
+  scene.appendChild(cube);
+  sceneWrap.appendChild(scene);
+
+  const resultLabel = document.createElement("div");
+  resultLabel.className = "void-roll-result";
+
+  const actionBtn = document.createElement("button");
+  actionBtn.className = "modal-btn void-roll-btn";
+  actionBtn.textContent = "Roll";
+  actionBtn.addEventListener("click", () => {
+    if (instance.favoredFace != null) {
+      // Second click, now labeled Continue - the roll already happened.
+      onDone();
+      return;
+    }
+
+    const value = 1 + Math.floor(Math.random() * 6);
+    instance.favoredFace = value;
+    // Disabled for the length of the tumble so a second click can't slip
+    // through the "Continue" branch above (favoredFace is already set by
+    // this point) before the die has actually finished landing.
+    actionBtn.disabled = true;
+
+    const target = FACE_ROTATION[value];
+    const totalDuration = 1.5 + Math.random() * 0.2;
+    scene.classList.remove("bouncing");
+    void scene.offsetWidth; // restart the bounce animation
+    scene.style.animationDuration = totalDuration + "s";
+    scene.classList.add("bouncing");
+    const finalRotation = {
+      x: computeTumbleAngle(0, target.x),
+      y: computeTumbleAngle(0, target.y),
+    };
+    cube.style.transitionDuration = totalDuration + "s";
+    cube.style.transform = `rotateX(${finalRotation.x}deg) rotateY(${finalRotation.y}deg)`;
+
+    setTimeout(() => {
+      resultLabel.textContent = `Favored face: ${value}`;
+      resultLabel.classList.add("revealed");
+      actionBtn.textContent = "Continue";
+      actionBtn.disabled = false;
+    }, totalDuration * 1000);
+
+    saveState();
+  });
+
+  modalBox.appendChild(h2);
+  modalBox.appendChild(p);
+  modalBox.appendChild(sceneWrap);
+  modalBox.appendChild(resultLabel);
+  modalBox.appendChild(actionBtn);
+  modalOverlay.classList.remove("hidden");
+  modalBox.focus();
+}
+
+// Blessing of The Hourglass's own confirmation (see activateUsable()) -
+// shown only when the player has no Extra Dice, since the +2 turns would
+// then be entirely wasted (turnLimit()'s own fillable-categories cap caps
+// the level back down to however many categories actually exist). Same
+// danger-confirm template as showLevelCompleteModal()'s own replace-step
+// confirmation, just with "Back"/"Activate" instead of "Cancel"/"Confirm" -
+// backing out leaves the token owned and unspent, same as never having
+// clicked it (see activateUsable(), which doesn't spend it either).
+function renderBlessingHourglassConfirm(usableInstanceId) {
+  modalBox.innerHTML = "";
+  modalBox.classList.add("danger-confirm");
+  modalBox.classList.remove("modal-scrollable");
+
+  const h2 = document.createElement("h2");
+  h2.textContent = "No Extra Die";
+  const p = document.createElement("p");
+  p.textContent = "No Extra Die. Only 15 possible categories to throw. Are you sure you want to activate +2 turns?";
+
+  const activateBtn = document.createElement("button");
+  activateBtn.className = "modal-btn danger-confirm-btn";
+  activateBtn.textContent = "Activate";
+  activateBtn.addEventListener("click", () => {
+    state.activeBlessings.push({ id: "blessing_theHourglass" });
+    const index = state.usablesOwned.findIndex((u) => u.instanceId === usableInstanceId);
+    if (index !== -1) state.usablesOwned.splice(index, 1);
+    modalBox.classList.remove("danger-confirm");
+    hideModal();
+    renderAll();
+    rollBtn.focus();
+    saveState();
+  });
+
+  const backBtn = document.createElement("button");
+  backBtn.className = "modal-btn pack-skip-btn";
+  backBtn.textContent = "Back";
+  backBtn.addEventListener("click", () => {
+    modalBox.classList.remove("danger-confirm");
+    hideModal();
+    renderAll();
+    rollBtn.focus();
+  });
+
+  modalBox.appendChild(h2);
+  modalBox.appendChild(p);
+  modalBox.appendChild(activateBtn);
+  modalBox.appendChild(backBtn);
+  modalOverlay.classList.remove("hidden");
+  modalBox.focus();
+}
+
 function showGameOverModal(total) {
   state.gameOver = true;
   renderControls();
@@ -8453,8 +10543,23 @@ function navigateScorecard(direction) {
 document.addEventListener("keydown", (e) => {
   // While a modal (level-up / game-over) or the card collection popup is
   // open, let its own buttons handle their own native Enter/Space
-  // activation instead of the game shortcuts.
-  if (!modalOverlay.classList.contains("hidden")) return;
+  // activation instead of the game shortcuts - EXCEPT The Void's roll
+  // popup (renderVoidRollModal()): its Roll/Continue button is never
+  // itself focused (modalBox.focus() deliberately moves focus to the
+  // modal container instead, per the comment there about a stray
+  // Enter/Space re-activating whatever was focused underneath), so native
+  // Enter/Space activation never reaches that button on its own - wire it
+  // up here instead, same key set the rest of this handler already uses.
+  if (!modalOverlay.classList.contains("hidden")) {
+    if (modalBox.classList.contains("void-roll-modal") && (e.key === " " || e.key === "Spacebar" || e.key === "Enter")) {
+      const voidRollBtn = modalBox.querySelector(".void-roll-btn");
+      if (voidRollBtn && !voidRollBtn.disabled) {
+        e.preventDefault();
+        voidRollBtn.click();
+      }
+    }
+    return;
+  }
   if (!collectionOverlay.classList.contains("hidden")) return;
   if (!bossesOverlay.classList.contains("hidden")) return;
 
@@ -8590,7 +10695,32 @@ restartBtn.addEventListener("click", () => {
 debugMoneyBtn.addEventListener("click", () => {
   state.money += 100;
   renderStats();
+  // Without this, a shop purchase (boss usable slot or a small-game shop
+  // card) that only just became affordable stayed stuck showing its
+  // "disabled/greyed out" state until some unrelated later render - exactly
+  // the kind of money-gated feature this button exists to test.
+  renderPackShop();
   saveState();
+});
+
+// Debug-only: opens a real Blessing pack offer on demand, without needing
+// to actually buy one from a boss shop slot first - same setup
+// activateUsable()'s own "blessing" branch does, just with
+// pendingBlessingInstanceId left null since there's no real usablesOwned
+// instance to free once this resolves (resolveBlessingOffer()'s own
+// findIndex() lookup already no-ops safely when nothing matches). Refuses
+// to stomp an offer/modal that's already open, same guard usableActivatable()
+// applies to the real button.
+debugBlessingBtn.addEventListener("click", () => {
+  if (state.gameOver || state.pendingPackOffer || !modalOverlay.classList.contains("hidden")) return;
+  state.pendingBlessingInstanceId = null;
+  state.pendingPackKind = "blessing";
+  state.pendingPackOffer = sampleBlessingIds(Math.random() < 0.5 ? 2 : 3);
+  state.pendingPackBoostedKeys = [];
+  state.pendingPackShinyKeys = [];
+  state.pendingPackIsMega = false;
+  pendingPackFlipIn = true;
+  showPackOfferModal();
 });
 
 // On/off switch for the ember/purple/rain/ash particle themes (see the
@@ -9153,10 +11283,21 @@ function buildCollectionCard(name, desc, requires, variantClass, stacks, icon, o
 function attachClampedTooltip(card, tooltip, boundsEl) {
   card.addEventListener("mouseenter", () => {
     tooltip.style.transition = "none";
+    tooltip.classList.remove("tooltip-flip-down");
     tooltip.style.transform = "translate(-50%, 0)"; // matches the CSS :hover rule's resting transform
-    const tooltipRect = tooltip.getBoundingClientRect();
+    let tooltipRect = tooltip.getBoundingClientRect();
     const boundsRect = boundsEl.getBoundingClientRect();
     const margin = 10;
+    // Vertical: the default "pop upward" placement clips straight past the
+    // TOP of a scrolling panel (the scorecard, mainly - a category row near
+    // its own top edge) since overflow-y: auto cuts off anything above it,
+    // same as a horizontal edge would. Flip to open below the element
+    // instead whenever that would happen, then re-measure at the new spot
+    // before the horizontal clamp below runs.
+    if (tooltipRect.top < boundsRect.top + margin) {
+      tooltip.classList.add("tooltip-flip-down");
+      tooltipRect = tooltip.getBoundingClientRect();
+    }
     let shiftX = 0;
     if (tooltipRect.left < boundsRect.left + margin) {
       shiftX = (boundsRect.left + margin) - tooltipRect.left;
@@ -9166,11 +11307,19 @@ function attachClampedTooltip(card, tooltip, boundsEl) {
     void tooltip.offsetWidth; // force reflow so the snap above is committed before re-enabling the transition
     tooltip.style.transition = "";
     tooltip.style.transform = shiftX !== 0 ? `translate(calc(-50% + ${shiftX}px), 0)` : "translate(-50%, 0)";
+    // The chevron (::after, see style.css) is centered on the TOOLTIP's own
+    // box, not the source element - without this it drifted right along
+    // with any horizontal shift above, no longer pointing at what it's
+    // actually describing. Counter-shifting it by the exact opposite
+    // amount keeps it visually pinned to the element's own center
+    // regardless of how far the box itself had to move.
+    tooltip.style.setProperty("--tooltip-arrow-shift", `${-shiftX}px`);
   });
 
   card.addEventListener("mouseleave", () => {
     tooltip.style.transition = "";
     tooltip.style.transform = "";
+    tooltip.classList.remove("tooltip-flip-down");
   });
 }
 
@@ -9251,11 +11400,26 @@ function renderCollection() {
 
   collectionUsables.innerHTML = "";
   USABLE_POOL.forEach((usable) => {
-    const desc = `${usable.desc} Cost: $${usable.cost}. Bought from the boss shop slot.`;
+    // Blessing (2)/(3) themselves are skipped here - buying one now opens
+    // its picker instantly instead of sitting owned as its own pack (see
+    // buyBossUsable()), so there's no real "pack" item left to show off;
+    // the individual Blessing cards it can offer are listed below instead.
+    if (usable.id === "blessing2" || usable.id === "blessing3") return;
+    const desc = usable.desc ? `${usable.desc} Cost: $${usable.cost}.` : `Cost: $${usable.cost}.`;
     // Same "(one time)" tag as UNIQUE_PERMANENT_RULE_IDS cards above - every
     // usable can only ever be bought once per run (see pickRandomUsableId()/
     // buyBossUsable()'s usablesPurchasedIds tracking).
-    collectionUsables.appendChild(buildCollectionCard(usable.name, desc, null, "usable", null, null, true));
+    collectionUsables.appendChild(buildCollectionCard(usable.name, desc, null, "usable", null, null, !usable.repeatable));
+  });
+  // The individual Blessing cards themselves (BLESSING_POOL) - what a
+  // Blessing (2)/(3) pack above actually offers once opened. Colored by
+  // whichever boss each one belongs to (same tintClass every other per-
+  // boss element uses), via .collection-card.blessing-card variants in
+  // style.css rather than reusing .blessing-card directly (that one's
+  // built for the white pack-offer card look, not this dark grid).
+  BLESSING_POOL.forEach((blessing) => {
+    const variant = "blessing-card" + (blessing.tintClass ? ` ${blessing.tintClass}` : "");
+    collectionUsables.appendChild(buildCollectionCard(blessing.name, blessing.desc, null, variant));
   });
 }
 

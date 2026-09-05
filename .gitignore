@@ -1,0 +1,2 @@
+# Claude Code runtime artifacts - process-specific, not part of the project.
+.claude/*.lock
